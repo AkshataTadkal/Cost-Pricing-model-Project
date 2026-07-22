@@ -1,1 +1,1 @@
-Please commit your code here.
+Discrete Cost Model
