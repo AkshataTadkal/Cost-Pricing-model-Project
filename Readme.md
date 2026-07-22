@@ -1,1 +1,1 @@
-Please commit your code here.
+A Streamlit-based intelligent pricing application for configurable KMAT products. The application performs product configuration, manufacturing cost estimation, pricing recommendations, revenue leakage analysis, approval workflow, and AI-powered pricing insights.
