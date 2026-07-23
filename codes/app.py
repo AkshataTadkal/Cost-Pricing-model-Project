@@ -1185,6 +1185,28 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🏆  Competitor Pricing"
 ])
 
+# ──────────────────────────────────────────────
+# TAB RENDER-FLICKER FIX
+# BaseWeb applies its own display CSS to tab panels, which overrides the
+# native `hidden` attribute Streamlit sets on inactive tabs. That causes a
+# brief flash where EVERY tab's content appears at once on each rerun /
+# tab switch. Forcing hidden panels to display:none removes the glitch.
+# ──────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* Force inactive tab panels to stay fully hidden (kills the flash) */
+    div[data-testid="stTabs"] div[role="tabpanel"][hidden] {
+        display: none !important;
+        visibility: hidden !important;
+        height: 0 !important;
+        overflow: hidden !important;
+    }
+    /* Belt-and-suspenders for older/newer Streamlit builds */
+    .stTabs [data-baseweb="tab-panel"][aria-hidden="true"] {
+        display: none !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ════════════════════════════════════════════
 # TAB 1 — EXECUTIVE OVERVIEW  (unchanged — pure KPIs/charts, no business rules)
