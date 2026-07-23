@@ -97,10 +97,8 @@ The platform leverages **Snowflake Cortex AI** to provide intelligent business r
 | Frontend | Streamlit |
 | Backend | Python |
 | Database | Snowflake |
-| Data Processing | Snowpark |
 | AI | Snowflake Cortex AI |
 | Query Language | SQL |
-| Data Analysis | Pandas |
 
 ---
 
@@ -164,32 +162,6 @@ Streamlit Dashboard
 - Explainable AI recommendations
 - Enterprise-ready Snowflake-native architecture
 
----
-
-# 🔮 Future Roadmap
-
-### Phase 1
-- AI Demand Forecasting
-- Dynamic Market Intelligence
-
-### Phase 2
-- Multi-Agent AI Decision System
-- Autonomous Pricing Recommendations
-
-### Phase 3
-- Real-Time Manufacturing Digital Twin
-- IoT-based Production Monitoring
-
-### Phase 4
-- Enterprise Workflow & Approval Engine
-- Role-Based Access Control (RBAC)
-- Audit Logging
-
-### Phase 5
-- Predictive Executive Intelligence Dashboard
-- Revenue Forecasting
-- Customer Churn Prediction
-- Predictive Margin Analysis
 
 ---
 
