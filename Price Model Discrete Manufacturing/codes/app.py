@@ -1174,37 +1174,41 @@ with st.expander("🔧 Cortex AI Diagnostics — click if AI cards show 'AI Unav
 # TABS
 # ──────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "🏠  Overview",
-    "🏢  Executive Decision Center",
-    "💰  Price Engine",
-    "⚙️  Simulation Hub",
-    "🌍  Digital Twin",
-    "🧠  AI Advisor",
-    "📄  Contract Analyzer",
-    "🏆  Competitor Pricing"
-])
+# ──────────────────────────────────────────────
+# NAVIGATION — single-render (kills the tab flicker permanently).
+# st.tabs() paints EVERY tab body on every rerun and only hides the
+# inactive ones via CSS afterwards, so a heavy 9-tab app flashes all
+# content on each switch. Rendering only the selected tab removes the
+# flash completely AND stops every tab's Cortex calls firing each rerun.
+# ──────────────────────────────────────────────
+_TAB_LABELS = [
+    "🏠 Overview",
+    "🏢 Executive Decision Center",
+    "💰 Price Engine",
+    "⚙️ Simulation Hub",
+    "🌍 Digital Twin",
+    "🧠 AI Advisor",
+    "📄 Contract Analyzer",
+    "🏆 Competitor Pricing",
+    "📈 AI Demand Forecasting",
+]
+_active_tab = st.radio(
+    "Navigate", _TAB_LABELS, horizontal=True,
+    label_visibility="collapsed", key="main_nav_tab")
+divider()
 
-# ──────────────────────────────────────────────
-# TAB RENDER-FLICKER FIX
-# BaseWeb applies its own display CSS to tab panels, which overrides the
-# native `hidden` attribute Streamlit sets on inactive tabs. That causes a
-# brief flash where EVERY tab's content appears at once on each rerun /
-# tab switch. Forcing hidden panels to display:none removes the glitch.
-# ──────────────────────────────────────────────
+
 st.markdown("""
 <style>
-    /* Force inactive tab panels to stay fully hidden (kills the flash) */
-    div[data-testid="stTabs"] div[role="tabpanel"][hidden] {
-        display: none !important;
-        visibility: hidden !important;
-        height: 0 !important;
-        overflow: hidden !important;
-    }
-    /* Belt-and-suspenders for older/newer Streamlit builds */
-    .stTabs [data-baseweb="tab-panel"][aria-hidden="true"] {
-        display: none !important;
-    }
+div[role="radiogroup"] { gap:.35rem; flex-wrap:wrap; }
+div[role="radiogroup"] > label {
+    background:rgba(255,255,255,.04);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:10px; padding:8px 14px; margin:0 !important;
+    cursor:pointer; transition:all .15s ease;
+}
+div[role="radiogroup"] > label:hover { background:rgba(56,189,248,.12); }
+div[role="radiogroup"] > label > div:first-child { display:none; } /* hide radio dot */
 </style>
 """, unsafe_allow_html=True)
 
@@ -1212,7 +1216,7 @@ st.markdown("""
 # TAB 1 — EXECUTIVE OVERVIEW  (unchanged — pure KPIs/charts, no business rules)
 # ════════════════════════════════════════════
 
-with tab1:
+if _active_tab == "🏠 Overview":
 
     section("📊", "Business KPIs")
 
@@ -1302,8 +1306,7 @@ with tab1:
 # 🏢 EXECUTIVE DECISION CENTER   — AI-integrated
 #============================================================================
 
-with tab2:
-
+if _active_tab == "🏢 Executive Decision Center":
     # ------------------------------------------------------------------
     # Load core tables once, safely. Every downstream block checks
     # `.empty` / column existence before using these, so a missing table
@@ -1938,8 +1941,7 @@ with tab2:
 # AI-integrated: recommendation text at every stage is now Cortex-generated,
 # with the original rule-based text kept as a safety-net fallback.
 # ════════════════════════════════════════════
-with tab3:
-
+if _active_tab == "💰 Price Engine":
     section("🔍", "Price Optimization Engine")
     st.markdown(
         '<p style="color:#6B8BAF;font-size:13px;margin-top:-8px;">'
@@ -3148,8 +3150,7 @@ Elasticity model: each 5% margin increase reduces demand by ~2%. This price maxi
 # TAB 3 — SIMULATION HUB  (unchanged — deterministic simulation math only)
 # ════════════════════════════════════════════
 
-with tab4:
-
+if _active_tab == "⚙️ Simulation Hub":
     section("⚙️", "Simulation Control Center")
     st.markdown('<p style="color:#6B8BAF;font-size:13px;margin-top:-8px;">Run custom cost-price scenarios and track simulation history.</p>', unsafe_allow_html=True)
 
@@ -3300,8 +3301,7 @@ with tab4:
 # TAB 4 — DIGITAL TWIN  — Margin Leakage AI integration
 # ════════════════════════════════════════════
 
-with tab5:
-
+if _active_tab == "🌍 Digital Twin":
     section("🌍", "Pricing Digital Twin")
     st.markdown('<p style="color:#6B8BAF;font-size:13px;margin-top:-8px;">Model future market shocks before they hit your bottom line.</p>', unsafe_allow_html=True)
 
@@ -3460,8 +3460,7 @@ with tab5:
 # TAB 5 — AI ADVISOR  — fully AI-driven recommendations
 # ════════════════════════════════════════════
 
-with tab6:
-
+if _active_tab == "🧠 AI Advisor":
     section("🧠", "AI Pricing Strategy Advisor")
     st.markdown('<p style="color:#6B8BAF;font-size:13px;margin-top:-8px;">Cortex AI-generated strategic analysis from the latest Digital Twin simulation.</p>', unsafe_allow_html=True)
 
@@ -3610,8 +3609,7 @@ Primary Recommended Action:
 # TAB 6 — CONTRACT ANALYZER  — AI_CLASSIFY risk + AI_COMPLETE explanations
 # ════════════════════════════════════════════
 
-with tab7:
-
+if _active_tab == "📄 Contract Analyzer":
     section("📄", "Contract Impact Analyzer")
     st.markdown('<p style="color:#6B8BAF;font-size:13px;margin-top:-8px;">Analyze contract profitability under future cost increases, with Cortex AI risk classification.</p>', unsafe_allow_html=True)
 
@@ -3757,7 +3755,7 @@ Recommended Action:
 # TAB 7 — COMPETITOR PRICING  — AI-integrated
 # ════════════════════════════════════════════
 
-with tab8:
+if _active_tab == "🏆 Competitor Pricing":
 
     # ── Helper: safe percentage change ──────────────────────────────────────
     def safe_pct(a, b):
@@ -4301,6 +4299,829 @@ with tab8:
                     st.info("ℹ️ Product is competitively positioned. Continue monitoring market and maintain current strategy.")
 
 
+# ════════════════════════════════════════════════════════════════════════
+# TAB 9 — 📈 AI DEMAND FORECASTING & DYNAMIC MARKET INTELLIGENCE
+# Reuses: session, section(), divider(), health_bar_html(), safe_pct_change(),
+# _ai_cache_key(), _sql_escape(), ai_complete/ai_classify/ai_filter/
+# ai_agg_over_rows/ai_summarize, parse_ai_json, ai_or_fallback,
+# ai_reason_score, ai_reason_score_batch, render_ai_score_card, AI memory + cache.
+# NO FAKE DATA: forecasts come ONLY from real rows in CORE_INPUT.DEMAND_HISTORY.
+# Deterministic math for numbers; Cortex AI for interpretation only.
+# ════════════════════════════════════════════════════════════════════════
+if _active_tab == "📈 AI Demand Forecasting":    
+    import numpy as np
+
+    # ── Optional Plotly (matches your dark theme). Falls back to native SiS
+    #    charts if Plotly is unavailable, so the tab never crashes. ──
+    try:
+        import plotly.graph_objects as go
+        _PLOTLY_OK = True
+    except Exception:
+        _PLOTLY_OK = False
+
+    _NDM_LAYOUT = dict(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#E6EDF3", size=12),
+        margin=dict(l=10, r=10, t=34, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+    )
+    _C_TEAL, _C_BLUE, _C_AMBER, _C_RED, _C_PURPLE = (
+        "#00C7B2", "#38BDF8", "#F59E0B", "#EF4444", "#A78BFA")
+
+    # ── Safe loaders (own copies; tab2's _safe_load is out of scope here) ──
+    def _ndm_load(query: str) -> pd.DataFrame:
+        try:
+            return session.sql(query).to_pandas()
+        except Exception:
+            return pd.DataFrame()
+
+    def _ndm_table_exists(fqtn: str) -> bool:
+        try:
+            session.sql(f"SELECT 1 FROM {fqtn} LIMIT 1").collect()
+            return True
+        except Exception:
+            return False
+
+    # ── Chart helpers (Plotly first, native fallback) ──
+    
+    def _ndm_line(df, x, series: dict, title, height=300):
+        # series: {col_name: color}
+        st.caption(title)
+        if df is None or df.empty:
+
+            st.info("No data to plot.")
+            return
+        if _PLOTLY_OK:
+            fig = go.Figure()
+            for col, color in series.items():
+                if col in df.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df[x], y=df[col], name=col, mode="lines+markers",
+                        line=dict(color=color, width=2)))
+            fig.update_layout(**_NDM_LAYOUT, height=height)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.line_chart(df.set_index(x)[[c for c in series if c in df.columns]], height=height)
+
+    def _ndm_forecast_plot(hist_df, fc_df, qty_col, title, height=340):
+        st.caption(title)
+        if _PLOTLY_OK:
+            fig = go.Figure()
+            # confidence band
+            fig.add_trace(go.Scatter(
+                x=list(fc_df["PERIOD"]) + list(fc_df["PERIOD"][::-1]),
+                y=list(fc_df["UPPER"]) + list(fc_df["LOWER"][::-1]),
+                fill="toself", fillcolor="rgba(56,189,248,0.15)",
+                line=dict(color="rgba(0,0,0,0)"), name="Confidence Range",
+                hoverinfo="skip"))
+            fig.add_trace(go.Scatter(
+                x=hist_df["PERIOD"], y=hist_df[qty_col], name="Historical Demand",
+                mode="lines+markers", line=dict(color=_C_TEAL, width=2)))
+            fig.add_trace(go.Scatter(
+                x=fc_df["PERIOD"], y=fc_df["FORECAST"], name="Forecast",
+                mode="lines+markers", line=dict(color=_C_BLUE, width=2, dash="dash")))
+            fig.update_layout(**_NDM_LAYOUT, height=height)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            h = hist_df.rename(columns={qty_col: "Historical"})[["PERIOD", "Historical"]]
+            f = fc_df.rename(columns={"FORECAST": "Forecast"})[["PERIOD", "Forecast", "LOWER", "UPPER"]]
+            merged = pd.concat([h, f], ignore_index=True).set_index("PERIOD")
+            st.line_chart(merged, height=height)
+
+    # ── Deterministic forecast engine (linear trend + residual CI band) ──
+    def _ndm_forecast(series_df, date_col, qty_col, periods_ahead, min_points=4):
+        """Returns dict with history(agg), forecast(df), confidence(0-100 from R²),
+        slope, n. All numbers traceable to real rows — no AI, no fabrication."""
+        if series_df is None or series_df.empty:
+            return None
+        df = series_df[[date_col, qty_col]].copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col, qty_col])
+        if df.empty:
+            return None
+        df["PERIOD"] = df[date_col].dt.to_period("M").dt.to_timestamp()
+        agg = df.groupby("PERIOD")[qty_col].sum().reset_index().sort_values("PERIOD")
+        agg = agg.rename(columns={qty_col: "QTY"})
+        n = len(agg)
+        if n < min_points:
+            return {"insufficient": True, "history": agg, "n": n}
+        x = np.arange(n, dtype=float)
+        y = agg["QTY"].values.astype(float)
+        slope, intercept = np.polyfit(x, y, 1)
+        fitted = slope * x + intercept
+        resid = y - fitted
+        ss_res = float(np.sum(resid ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        resid_std = float(np.std(resid, ddof=1)) if n > 2 else float(np.std(resid))
+        agg["MOVING_AVG"] = agg["QTY"].rolling(window=min(3, n), min_periods=1).mean()
+        fx = np.arange(n, n + periods_ahead, dtype=float)
+        fy = np.clip(slope * fx + intercept, 0, None)
+        z = 1.645  # ~90% band
+        lower = np.clip(fy - z * resid_std, 0, None)
+        upper = fy + z * resid_std
+        step = agg["PERIOD"].diff().median()
+        if pd.isna(step) or step == pd.Timedelta(0):
+            step = pd.Timedelta(days=30)
+        last = agg["PERIOD"].iloc[-1]
+        fut = [last + step * (i + 1) for i in range(periods_ahead)]
+        fc = pd.DataFrame({"PERIOD": fut, "FORECAST": fy, "LOWER": lower, "UPPER": upper})
+        return {"insufficient": False, "history": agg, "forecast": fc,
+                "confidence": max(0.0, min(100.0, r2 * 100)), "r2": r2,
+                "slope": float(slope), "n": n, "resid_std": resid_std,
+                "recent": float(y[-1]), "fc_avg": float(np.mean(fy)),
+                "fc_total": float(np.sum(fy))}
+
+    # ── HEADER ──
+    section("📈", "AI Demand Forecasting & Dynamic Market Intelligence")
+    st.markdown(
+        '<div style="opacity:.75;margin-top:-6px">Forecasts future demand from real '
+        'order history, then fuses pricing, PSI, capacity and competitor signals into '
+        'Cortex AI-driven market intelligence.</div>',
+        unsafe_allow_html=True)
+    divider()
+
+    # ── Load reusable snapshot tables (never crash if one is missing) ──
+    costs_df = _ndm_load("SELECT SKU, TOTAL_COST FROM PRICING_ENGINE_DB.CORE_INPUT.CALCULATED_STANDARD_COSTS")
+    matrix_df9 = _ndm_load("SELECT * FROM PRICING_ENGINE_DB.CORE_OUTPUT.OPTIMIZED_PRICING_MATRIX")
+    pricing_df9 = _ndm_load("SELECT * FROM PRICING_ENGINE_DB.CORE_OUTPUT.CUSTOMER_PRICING")
+    psi_df9 = _ndm_load("SELECT * FROM PRICING_ENGINE_DB.CORE_INPUT.PRICE_SENSITIVITY")
+    cap_df9 = _ndm_load("SELECT * FROM PRICING_ENGINE_DB.CORE_INPUT.PLANT_CAPACITY")
+    comp_df9 = _ndm_load("SELECT * FROM PRICING_ENGINE_DB.CORE_INPUT.COMPETITOR_PRICING")
+
+    DEMAND_TBL = "PRICING_ENGINE_DB.CORE_INPUT.DEMAND_HISTORY"
+    has_demand_tbl = _ndm_table_exists(DEMAND_TBL)
+    demand_df = _ndm_load(f"SELECT * FROM {DEMAND_TBL}") if has_demand_tbl else pd.DataFrame()
+    has_demand = has_demand_tbl and not demand_df.empty and "QUANTITY" in demand_df.columns \
+        and "DEMAND_DATE" in demand_df.columns
+
+    if not has_demand:
+        st.warning(
+            "⚠️ **Historical demand data required.** No usable rows found in "
+            f"`{DEMAND_TBL}`. Create/load that table (SQL provided with this feature) "
+            "with **real ERP/order history** to unlock forecasting. "
+            "All snapshot-based intelligence below (pricing, PSI, capacity, competitor) "
+            "still works now; demand/forecast/revenue-forecast sections activate "
+            "automatically once real data exists.")
+
+    # Representative selling price per SKU (deterministic, from real snapshot)
+    def _ndm_price_for_sku(sku):
+        try:
+            if not pricing_df9.empty and {"SKU", "DISCOUNTED_PRICE"}.issubset(pricing_df9.columns):
+                s = pricing_df9[pricing_df9["SKU"] == sku]["DISCOUNTED_PRICE"]
+                if not s.empty:
+                    return float(s.mean())
+            if not matrix_df9.empty and {"SKU", "TARGET_PRICE"}.issubset(matrix_df9.columns):
+                s = matrix_df9[matrix_df9["SKU"] == sku]["TARGET_PRICE"]
+                if not s.empty:
+                    return float(s.mean())
+        except Exception:
+            pass
+        return None
+
+    # ── 6. FILTERS ──
+    section("🎛️", "Filters")
+    HORIZON_MAP = {"30 Days": 1, "90 Days": 3, "6 Months": 6, "12 Months": 12}
+    fc1, fc2, fc3, fc4 = st.columns(4)
+
+    prod_opts = ["All Products"]
+    cust_opts = ["All Customers"]
+    region_opts = ["All Regions"]
+    if has_demand:
+        prod_opts += sorted(demand_df["SKU"].dropna().unique().tolist()) if "SKU" in demand_df.columns else []
+        if "CUSTOMER_ID" in demand_df.columns:
+            cust_opts += sorted(demand_df["CUSTOMER_ID"].dropna().unique().tolist())
+        if "REGION" in demand_df.columns and demand_df["REGION"].notna().any():
+            region_opts += sorted(demand_df["REGION"].dropna().unique().tolist())
+    else:
+        if not costs_df.empty:
+            prod_opts += sorted(costs_df["SKU"].dropna().unique().tolist())
+
+    with fc1:
+        f_product = st.selectbox("Product", prod_opts, key="ndm_product")
+    with fc2:
+        f_customer = st.selectbox("Customer", cust_opts, key="ndm_customer")
+    with fc3:
+        f_horizon = st.selectbox("Forecast Horizon", list(HORIZON_MAP.keys()), index=2, key="ndm_horizon")
+    with fc4:
+        f_region = st.selectbox("Region", region_opts, key="ndm_region")
+    periods = HORIZON_MAP[f_horizon]
+
+    # Build the filtered demand slice (real rows only)
+    scope = demand_df.copy() if has_demand else pd.DataFrame()
+    if has_demand:
+        if f_product != "All Products" and "SKU" in scope.columns:
+            scope = scope[scope["SKU"] == f_product]
+        if f_customer != "All Customers" and "CUSTOMER_ID" in scope.columns:
+            scope = scope[scope["CUSTOMER_ID"] == f_customer]
+        if f_region != "All Regions" and "REGION" in scope.columns:
+            scope = scope[scope["REGION"] == f_region]
+
+    # Master forecast for current scope
+    scope_fc = _ndm_forecast(scope, "DEMAND_DATE", "QUANTITY", periods) if has_demand else None
+    divider()
+
+    # ── 7. DEMAND KPI CARDS ──
+    section("📊", "Demand KPIs")
+    if scope_fc and not scope_fc.get("insufficient"):
+        rep_price = None
+        if f_product != "All Products":
+            rep_price = _ndm_price_for_sku(f_product)
+        if rep_price is None and "SELLING_PRICE" in scope.columns and scope["SELLING_PRICE"].notna().any():
+            rep_price = float(scope["SELLING_PRICE"].mean())
+        cur_demand = scope_fc["recent"]
+        fc_demand = scope_fc["fc_total"]
+        change_pct = safe_pct_change(scope_fc["fc_avg"], cur_demand)
+        fc_rev = fc_demand * rep_price if rep_price else None
+        conf = scope_fc["confidence"]
+
+        risk_payload = ai_reason_score(
+            module="demand_forecast", decision_type="demand_risk",
+            context_facts=(
+                f"Scope: product={f_product}, customer={f_customer}, region={f_region}.\n"
+                f"Recent monthly demand: {cur_demand:,.0f} units.\n"
+                f"Avg forecast monthly demand ({f_horizon}): {scope_fc['fc_avg']:,.0f} units.\n"
+                f"Trend slope: {scope_fc['slope']:+.1f} units/month over {scope_fc['n']} months.\n"
+                f"Forecast confidence (fit R²): {conf:.0f}%."),
+            extra_instruction=("Assess demand risk. 'score' = demand health (higher=healthier). "
+                               "Consider volatility, trend direction and forecast confidence."),
+            cache_key=_ai_cache_key("ndm_risk", f_product, f_customer, f_region, f_horizon,
+                                    round(cur_demand), round(scope_fc['fc_avg'])))
+        risk_label = risk_payload["label"] if risk_payload.get("ai_generated") else "AI Unavailable"
+
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Current Demand", f"{cur_demand:,.0f}")
+        k2.metric("Forecast Demand", f"{fc_demand:,.0f}")
+        k3.metric("Expected Change", f"{change_pct:+.1f}%")
+        k4.metric("Forecast Revenue", f"₹{fc_rev:,.0f}" if fc_rev is not None else "N/A")
+        k5.metric("Forecast Confidence", f"{conf:.0f}%")
+        k6.metric("Demand Risk", risk_label)
+    elif scope_fc and scope_fc.get("insufficient"):
+        st.info(f"Only {scope_fc['n']} month(s) of history in the current scope — need ≥ 4 to forecast. "
+                "Widen the filters or load more history.")
+    else:
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        for c, lbl in zip([c1, c2, c3, c4, c5, c6],
+                           ["Current Demand", "Forecast Demand", "Expected Change",
+                            "Forecast Revenue", "Forecast Confidence", "Demand Risk"]):
+            c.metric(lbl, "N/A")
+        st.caption("KPIs populate once real demand history is available.")
+    divider()
+
+    # ── 8. HISTORICAL DEMAND ──
+    section("📊", "Historical Demand")
+    if has_demand and scope_fc and not scope_fc.get("insufficient"):
+        hist = scope_fc["history"]
+        _ndm_line(hist, "PERIOD",
+                  {"QTY": _C_TEAL, "MOVING_AVG": _C_AMBER},
+                  "Actual Demand vs 3-Month Moving Average (units)")
+        if "SELLING_PRICE" in scope.columns and scope["SELLING_PRICE"].notna().any():
+            price_hist = scope.copy()
+            price_hist["PERIOD"] = pd.to_datetime(price_hist["DEMAND_DATE"], errors="coerce") \
+                .dt.to_period("M").dt.to_timestamp()
+            price_series = price_hist.groupby("PERIOD")["SELLING_PRICE"].mean().reset_index()
+            _ndm_line(price_series, "PERIOD", {"SELLING_PRICE": _C_BLUE},
+                      "Historical Average Selling Price (₹)")
+    else:
+        st.info("Historical demand chart requires real rows in DEMAND_HISTORY.")
+    divider()
+
+    # ── 9. AI DEMAND FORECAST ──
+    section("🔮", "AI Demand Forecast")
+    if scope_fc and not scope_fc.get("insufficient"):
+        _ndm_forecast_plot(scope_fc["history"], scope_fc["forecast"], "QTY",
+                           f"Demand Forecast — next {f_horizon} (90% confidence band)")
+        show = scope_fc["forecast"].copy()
+        show["PERIOD"] = show["PERIOD"].dt.strftime("%Y-%m")
+        show = show.rename(columns={"PERIOD": "Forecast Date", "FORECAST": "Forecast Demand",
+                                    "LOWER": "Lower Bound", "UPPER": "Upper Bound"})
+        show["Confidence"] = f"{scope_fc['confidence']:.0f}%"
+        for c in ["Forecast Demand", "Lower Bound", "Upper Bound"]:
+            show[c] = show[c].round(0)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("Forecast = deterministic linear trend on real monthly demand; "
+                   "band = ±1.645·residual σ; confidence = fit R². No values are AI-invented.")
+    else:
+        st.info("Forecast activates once ≥ 4 months of real demand exist in the current scope.")
+    divider()
+# ── 9b. SAVE FORECAST TO SNOWFLAKE (mirrors OPTIMIZATION_RESULTS pattern) ──
+    if scope_fc and not scope_fc.get("insufficient"):
+        if st.button("💾 Save Forecast to Snowflake", key="ndm_save_fc",
+                     use_container_width=True):
+            try:
+                # Representative price for revenue (same logic as KPI/Revenue sections)
+                _rp = None
+                if f_product != "All Products":
+                    _rp = _ndm_price_for_sku(f_product)
+                if _rp is None and "SELLING_PRICE" in scope.columns \
+                        and scope["SELLING_PRICE"].notna().any():
+                    _rp = float(scope["SELLING_PRICE"].mean())
+
+                run_id = _ai_cache_key("fc_run", f_product, f_customer, f_region,
+                                       f_horizon, str(pd.Timestamp.utcnow()))
+                save_fc = scope_fc["forecast"].copy()
+                save_df = pd.DataFrame({
+                    "RUN_ID": run_id,
+                    "SCOPE_PRODUCT": f_product,
+                    "SCOPE_CUSTOMER": f_customer,
+                    "SCOPE_REGION": f_region,
+                    "HORIZON": f_horizon,
+                    "FORECAST_DATE": pd.to_datetime(save_fc["PERIOD"]).dt.date,
+                    "FORECAST_DEMAND": save_fc["FORECAST"].round(2),
+                    "LOWER_BOUND": save_fc["LOWER"].round(2),
+                    "UPPER_BOUND": save_fc["UPPER"].round(2),
+                    "CONFIDENCE_PCT": round(scope_fc["confidence"], 2),
+                    "TREND_SLOPE": round(scope_fc["slope"], 4),
+                    "REP_PRICE": (round(_rp, 2) if _rp is not None else None),
+                    "FORECAST_REVENUE": (
+                        (save_fc["FORECAST"] * _rp).round(2) if _rp is not None else None),
+                    "CREATED_AT": pd.Timestamp.utcnow(),
+                })
+                snow_df = session.create_dataframe(save_df)
+                snow_df.write.mode("append").save_as_table(
+                    "PRICING_ENGINE_DB.CORE_OUTPUT.DEMAND_FORECAST_RESULTS")
+                st.success(f"✅ Saved {len(save_df)} forecast row(s) to "
+                           f"CORE_OUTPUT.DEMAND_FORECAST_RESULTS (run {run_id[:8]}).")
+            except Exception as e:
+                st.warning(f"Save skipped: {e}")
+    divider()
+    # ── 10. DEMAND TREND INTELLIGENCE (Cortex interprets, no fixed rules) ──
+    section("🧭", "Demand Trend Intelligence")
+    if scope_fc and not scope_fc.get("insufficient"):
+        trend_label = ai_classify(
+            f"Monthly demand over {scope_fc['n']} months has trend slope "
+            f"{scope_fc['slope']:+.1f} units/month, fit R² {scope_fc['r2']:.2f}, "
+            f"recent value {scope_fc['recent']:,.0f}. Classify the demand pattern.",
+            ["Growth", "Stable", "Declining", "Volatile", "Seasonal", "Uncertain"],
+            cache_key=_ai_cache_key("ndm_trend_cls", f_product, f_customer, f_region,
+                                    round(scope_fc['slope'], 1), round(scope_fc['r2'], 2)))
+        trend_payload = ai_reason_score(
+            module="demand_forecast", decision_type="trend_intelligence",
+            context_facts=(
+                f"Scope product={f_product}, customer={f_customer}.\n"
+                f"Trend slope {scope_fc['slope']:+.1f} units/month, R² {scope_fc['r2']:.2f}, "
+                f"{scope_fc['n']} months, recent {scope_fc['recent']:,.0f}, "
+                f"forecast avg {scope_fc['fc_avg']:,.0f} for {f_horizon}."),
+            extra_instruction=("'score' = demand outlook strength (higher=better). Provide key "
+                               "drivers as opportunities and risk factors as risks."),
+            cache_key=_ai_cache_key("ndm_trend", f_product, f_customer, f_region, f_horizon,
+                                    round(scope_fc['slope'], 1)))
+        tc1, tc2 = st.columns([1, 1.4])
+        with tc1:
+            st.metric("Demand Trend", trend_label or "AI Unavailable")
+            st.metric("AI Confidence",
+                      f"{trend_payload['confidence']:.0f}%" if trend_payload.get("ai_generated") else "N/A")
+        with tc2:
+            render_ai_score_card(trend_payload, title_prefix="Demand Outlook")
+    else:
+        st.info("Trend intelligence requires a valid forecast in the current scope.")
+    divider()
+
+    # ── 11. PRODUCT DEMAND INTELLIGENCE (batched Cortex classification) ──
+    section("📦", "Product Demand Intelligence")
+    if has_demand and "SKU" in demand_df.columns:
+        prod_rows, prod_ctx = [], []
+        top_skus = (demand_df.groupby("SKU")["QUANTITY"].sum()
+                    .sort_values(ascending=False).head(12).index.tolist())
+        for sku in top_skus:
+            sdf = demand_df[demand_df["SKU"] == sku]
+            f = _ndm_forecast(sdf, "DEMAND_DATE", "QUANTITY", periods)
+            if not f or f.get("insufficient"):
+                continue
+            price = _ndm_price_for_sku(sku)
+            chg = safe_pct_change(f["fc_avg"], f["recent"])
+            rev_opp = (f["fc_total"] * price) if price else None
+            prod_rows.append({
+                "Product": sku, "Current Demand": round(f["recent"]),
+                "Forecast Demand": round(f["fc_total"]), "Expected Change": f"{chg:+.1f}%",
+                "Revenue Opportunity": (f"₹{rev_opp:,.0f}" if rev_opp is not None else "N/A"),
+                "_slope": f["slope"], "_r2": f["r2"]})
+            prod_ctx.append(f"Product {sku}: recent {f['recent']:,.0f} units, forecast avg "
+                            f"{f['fc_avg']:,.0f}, change {chg:+.1f}%, slope {f['slope']:+.1f}, R² {f['r2']:.2f}")
+        if prod_rows:
+            cls = ai_reason_score_batch(
+                module="demand_forecast", decision_type="product_demand_class",
+                items_context=prod_ctx,
+                extra_instruction=("Classify each product's demand as one of High Growth, Stable, "
+                                   "Declining, Volatile, Strategic, At Risk. 'label' = that class; "
+                                   "'reasoning' = one-line AI recommendation."),
+                cache_key=_ai_cache_key("ndm_prod_intel", f_horizon, tuple(prod_ctx)))
+            out = pd.DataFrame(prod_rows).drop(columns=["_slope", "_r2"])
+            out["Demand Classification"] = [c["label"] if c.get("ai_generated") else "AI Unavailable" for c in cls]
+            out["Risk"] = [f"{100 - c['score']:.0f}/100" if c.get("ai_generated") and c["score"] is not None
+                           else "N/A" for c in cls]
+            out["AI Recommendation"] = [c["reasoning"] if c.get("ai_generated") else "—" for c in cls]
+            st.dataframe(out, use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough per-product history yet to classify demand.")
+    else:
+        st.info("Product demand intelligence requires real DEMAND_HISTORY rows.")
+    divider()
+
+    # ── 12. CUSTOMER DEMAND INTELLIGENCE ──
+    section("👥", "Customer Demand Intelligence")
+    if has_demand and "CUSTOMER_ID" in demand_df.columns and demand_df["CUSTOMER_ID"].notna().any():
+        cust_rows, cust_ctx = [], []
+        top_custs = (demand_df.groupby("CUSTOMER_ID")["QUANTITY"].sum()
+                     .sort_values(ascending=False).head(12).index.tolist())
+        seg_map = {}
+        if not psi_df9.empty and {"CUSTOMER_ID", "CUSTOMER_SEGMENT"}.issubset(psi_df9.columns):
+            seg_map = dict(zip(psi_df9["CUSTOMER_ID"], psi_df9["CUSTOMER_SEGMENT"]))
+        for cust in top_custs:
+            cdf = demand_df[demand_df["CUSTOMER_ID"] == cust]
+            f = _ndm_forecast(cdf, "DEMAND_DATE", "QUANTITY", periods)
+            if not f or f.get("insufficient"):
+                continue
+            price = None
+            if "SELLING_PRICE" in cdf.columns and cdf["SELLING_PRICE"].notna().any():
+                price = float(cdf["SELLING_PRICE"].mean())
+            chg = safe_pct_change(f["fc_avg"], f["recent"])
+            rev_pot = (f["fc_total"] * price) if price else None
+            seg = seg_map.get(cust, "N/A")
+            cust_rows.append({
+                "Customer": cust, "Segment": seg, "Historical Volume": round(f["history"]["QTY"].sum()),
+                "Forecast Volume": round(f["fc_total"]), "Expected Change": f"{chg:+.1f}%",
+                "Revenue Potential": (f"₹{rev_pot:,.0f}" if rev_pot is not None else "N/A")})
+            cust_ctx.append(f"Customer {cust} (segment {seg}): recent {f['recent']:,.0f}, "
+                            f"forecast avg {f['fc_avg']:,.0f}, change {chg:+.1f}%, slope {f['slope']:+.1f}")
+        if cust_rows:
+            cls = ai_reason_score_batch(
+                module="demand_forecast", decision_type="customer_demand_class",
+                items_context=cust_ctx,
+                extra_instruction=("Classify each account as one of Growing, Stable, Declining, "
+                                   "Potential Expansion, At Risk. 'label' = that class; 'reasoning' "
+                                   "= one-line AI recommendation."),
+                cache_key=_ai_cache_key("ndm_cust_intel", f_horizon, tuple(cust_ctx)))
+            out = pd.DataFrame(cust_rows)
+            out["Customer Demand Outlook"] = [c["label"] if c.get("ai_generated") else "AI Unavailable" for c in cls]
+            out["AI Recommendation"] = [c["reasoning"] if c.get("ai_generated") else "—" for c in cls]
+            st.dataframe(out, use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough per-customer history yet to classify accounts.")
+    else:
+        st.info("Customer demand intelligence requires DEMAND_HISTORY with CUSTOMER_ID.")
+    divider()
+
+    # ── 13. PRICE vs DEMAND INTELLIGENCE ──
+    section("💰", "Price vs Demand Intelligence")
+    if has_demand and {"SELLING_PRICE", "QUANTITY"}.issubset(scope.columns) \
+            and scope["SELLING_PRICE"].notna().any():
+        pv = scope.dropna(subset=["SELLING_PRICE", "QUANTITY"]).copy()
+        if _PLOTLY_OK and not pv.empty:
+            fig = go.Figure(go.Scatter(
+                x=pv["SELLING_PRICE"], y=pv["QUANTITY"], mode="markers",
+                marker=dict(color=_C_PURPLE, size=8, opacity=0.7), name="Orders"))
+            fig.update_layout(**_NDM_LAYOUT, height=320,
+                              xaxis_title="Selling Price (₹)", yaxis_title="Quantity (units)")
+            st.caption("Selling Price vs Order Quantity")
+            st.plotly_chart(fig, use_container_width=True)
+        elif not pv.empty:
+            st.caption("Selling Price vs Order Quantity")
+            st.scatter_chart(pv, x="SELLING_PRICE", y="QUANTITY", height=320)
+        try:
+            corr = float(pv["SELLING_PRICE"].corr(pv["QUANTITY"]))
+        except Exception:
+            corr = None
+        psi_line = ""
+        if f_customer != "All Customers" and not psi_df9.empty \
+                and "PRICE_SENSITIVITY_INDEX" in psi_df9.columns:
+            prow = psi_df9[psi_df9["CUSTOMER_ID"] == f_customer]
+            if not prow.empty:
+                psi_line = f" Customer PSI={float(prow['PRICE_SENSITIVITY_INDEX'].iloc[0]):.2f}."
+        pd_interp = ai_complete(
+            f"Observed price-vs-demand correlation is {corr:.2f} (scope {f_product}/{f_customer})."
+            f"{psi_line} In 2 sentences, interpret how pricing appears to affect demand and one action.",
+            cache_key=_ai_cache_key("ndm_price_demand", f_product, f_customer,
+                                    round(corr, 2) if corr is not None else "na"))
+        if pd_interp:
+            st.info(pd_interp)
+        else:
+            st.caption("AI interpretation unavailable — showing correlation only: "
+                       f"{corr:.2f}" if corr is not None else "AI interpretation unavailable.")
+    else:
+        st.info("Price-vs-demand analysis requires SELLING_PRICE and QUANTITY in DEMAND_HISTORY.")
+    divider()
+
+    # ── 14. DYNAMIC MARKET INTELLIGENCE (reuses competitor snapshot) ──
+    section("🏆", "Dynamic Market Intelligence")
+    if f_product != "All Products" and not comp_df9.empty \
+            and {"SKU", "COMPETITOR_AVG_PRICE"}.issubset(comp_df9.columns):
+        crow = comp_df9[comp_df9["SKU"] == f_product]
+        our_price = _ndm_price_for_sku(f_product)
+        comp_avg = float(crow["COMPETITOR_AVG_PRICE"].mean()) if not crow.empty else None
+        gap = safe_pct_change(our_price, comp_avg) if (our_price and comp_avg) else None
+        win = None
+        if not matrix_df9.empty and "WIN_PROBABILITY" in matrix_df9.columns:
+            wr = matrix_df9[matrix_df9["SKU"] == f_product]["WIN_PROBABILITY"]
+            if not wr.empty:
+                win = float(wr.mean())
+                win = win * 100 if win <= 1 else win
+        demand_dir = (f"forecast trend {scope_fc['slope']:+.1f} units/mo"
+                      if scope_fc and not scope_fc.get("insufficient") else "no demand forecast yet")
+        mi_payload = ai_reason_score(
+            module="market_intelligence", decision_type="dynamic_market",
+            context_facts=(
+                f"SKU {f_product}: our price ₹{our_price:,.2f} vs competitor avg "
+                f"{('₹%.2f' % comp_avg) if comp_avg else 'N/A'} "
+                f"(gap {('%+.1f%%' % gap) if gap is not None else 'N/A'}).\n"
+                f"Win probability {('%.0f%%' % win) if win is not None else 'N/A'}. Demand: {demand_dir}."),
+            extra_instruction=("Assess market pressure, competitive threat, pricing opportunity and "
+                               "demand risk. 'score' = market position strength (higher=stronger). "
+                               "Give recommended market response in recommended_actions."),
+            cache_key=_ai_cache_key("ndm_market", f_product,
+                                    round(our_price or 0, 2), round(comp_avg or 0, 2)))
+        mm1, mm2, mm3 = st.columns(3)
+        mm1.metric("Our Price", f"₹{our_price:,.0f}" if our_price else "N/A")
+        mm2.metric("Competitor Avg", f"₹{comp_avg:,.0f}" if comp_avg else "N/A")
+        mm3.metric("Price Gap", f"{gap:+.1f}%" if gap is not None else "N/A")
+        render_ai_score_card(mi_payload, title_prefix="Market Position")
+    else:
+        st.info("Select a single Product with competitor data to run Dynamic Market Intelligence.")
+    divider()
+
+    # ── 15. DEMAND vs CAPACITY (deterministic arithmetic + AI interpretation) ──
+    section("🏭", "Demand vs Capacity")
+    if scope_fc and not scope_fc.get("insufficient") and not cap_df9.empty:
+        avail_col = "AVAILABLE_CAPACITY" if "AVAILABLE_CAPACITY" in cap_df9.columns else None
+        util_col9 = "CURRENT_UTILIZATION" if "CURRENT_UTILIZATION" in cap_df9.columns else None
+        total_avail = float(cap_df9[avail_col].sum()) if avail_col else None
+        avg_util = float(cap_df9[util_col9].mean()) if util_col9 else None
+        # forecast demand per month vs monthly available capacity (aggregate assumption noted)
+        fc_month = scope_fc["fc_avg"]
+        gap_units = (total_avail - fc_month) if total_avail is not None else None
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Forecast Demand / mo", f"{fc_month:,.0f}")
+        cc2.metric("Available Capacity", f"{total_avail:,.0f}" if total_avail is not None else "N/A")
+        cc3.metric("Current Utilization", f"{avg_util:.1f}%" if avg_util is not None else "N/A")
+        cap_payload = ai_reason_score(
+            module="market_intelligence", decision_type="demand_vs_capacity",
+            context_facts=(
+                f"Forecast avg monthly demand {fc_month:,.0f} units. Total available capacity "
+                f"{('%.0f' % total_avail) if total_avail is not None else 'N/A'} units. "
+                f"Avg utilization {('%.1f%%' % avg_util) if avg_util is not None else 'N/A'}. "
+                f"Headroom {('%.0f units' % gap_units) if gap_units is not None else 'N/A'}."),
+            extra_instruction=("Identify capacity shortage, excess capacity or imbalance and a "
+                               "production opportunity. 'score' = capacity readiness (higher=better). "
+                               "Note: capacity is aggregated across plants; not SKU-specific."),
+            cache_key=_ai_cache_key("ndm_cap", f_product, f_customer, round(fc_month),
+                                    round(total_avail or 0)))
+        render_ai_score_card(cap_payload, title_prefix="Capacity Readiness")
+        st.caption("Comparison uses total available capacity vs total forecast demand for the scope "
+                   "(plant capacity is not SKU-specific in your schema).")
+    else:
+        st.info("Demand-vs-capacity needs a valid forecast and PLANT_CAPACITY data.")
+    divider()
+
+    # ── 16. REVENUE FORECAST ──
+    section("💵", "Revenue Forecast")
+    if scope_fc and not scope_fc.get("insufficient"):
+        rep_price = None
+        if f_product != "All Products":
+            rep_price = _ndm_price_for_sku(f_product)
+        if rep_price is None and "SELLING_PRICE" in scope.columns and scope["SELLING_PRICE"].notna().any():
+            rep_price = float(scope["SELLING_PRICE"].mean())
+        if rep_price:
+            rev_fc = scope_fc["forecast"].copy()
+            rev_fc["Expected"] = rev_fc["FORECAST"] * rep_price
+            rev_fc["Worst"] = rev_fc["LOWER"] * rep_price
+            rev_fc["Best"] = rev_fc["UPPER"] * rep_price
+            rev_fc["PERIOD_LBL"] = rev_fc["PERIOD"].dt.strftime("%Y-%m")
+            cur_rev = scope_fc["recent"] * rep_price
+            tot_exp = float(rev_fc["Expected"].sum())
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("Recent Monthly Revenue", f"₹{cur_rev:,.0f}")
+            rc2.metric(f"Forecast Revenue ({f_horizon})", f"₹{tot_exp:,.0f}")
+            rc3.metric("Expected Change",
+                       f"{safe_pct_change(rev_fc['Expected'].mean(), cur_rev):+.1f}%")
+            _ndm_line(rev_fc, "PERIOD_LBL",
+                      {"Worst": _C_RED, "Expected": _C_TEAL, "Best": _C_BLUE},
+                      "Revenue Forecast — Worst / Expected / Best (₹)")
+            st.caption(f"Revenue = forecast demand × representative price ₹{rep_price:,.2f} "
+                       "(from CUSTOMER_PRICING / OPTIMIZED_PRICING_MATRIX). Range = demand CI × price.")
+        else:
+            st.info("No representative selling price available for this scope to compute revenue.")
+    else:
+        st.info("Revenue forecast activates once a valid demand forecast exists.")
+    divider()
+
+    # ── 17. AI MARKET OPPORTUNITY DETECTOR ──
+    section("💡", "AI Market Opportunity Detector")
+    opp_signals = []
+    if scope_fc and not scope_fc.get("insufficient") and scope_fc["slope"] > 0:
+        opp_signals.append(f"Demand trending up {scope_fc['slope']:+.1f} units/mo for scope "
+                           f"{f_product}/{f_customer}.")
+    if f_product != "All Products" and not comp_df9.empty and {"SKU", "COMPETITOR_AVG_PRICE"}.issubset(comp_df9.columns):
+        cr = comp_df9[comp_df9["SKU"] == f_product]
+        op = _ndm_price_for_sku(f_product)
+        if not cr.empty and op:
+            g = safe_pct_change(op, float(cr["COMPETITOR_AVG_PRICE"].mean()))
+            if g < -3:
+                opp_signals.append(f"Priced {g:+.1f}% below competitor average — room to raise price.")
+    if not cap_df9.empty and "AVAILABLE_CAPACITY" in cap_df9.columns and float(cap_df9["AVAILABLE_CAPACITY"].sum()) > 0:
+        opp_signals.append(f"{cap_df9['AVAILABLE_CAPACITY'].sum():,.0f} units of spare capacity to fill.")
+    if not psi_df9.empty and "PRICE_SENSITIVITY_INDEX" in psi_df9.columns:
+        low_sens = psi_df9[psi_df9["PRICE_SENSITIVITY_INDEX"] < 0.4]
+        if not low_sens.empty:
+            opp_signals.append(f"{low_sens.shape[0]} low-price-sensitivity customer(s) — premium-pricing potential.")
+    if opp_signals:
+        opp_rows = []
+        for raw in opp_signals:
+            sig = ai_filter(f"Is this a significant market opportunity worth executive attention? {raw}",
+                            cache_key=_ai_cache_key("ndm_opp_filter", raw))
+            if sig is False:
+                continue
+            txt = ai_complete(
+                f"Turn this signal into a JSON object with keys opportunity, target, reason, "
+                f"impact, confidence (0-100), action. Signal: {raw}",
+                cache_key=_ai_cache_key("ndm_opp_text", raw))
+            obj = parse_ai_json(txt) if txt else None
+            if isinstance(obj, dict):
+                opp_rows.append({
+                    "Opportunity": obj.get("opportunity", "Opportunity"),
+                    "Product/Customer": obj.get("target", f_product),
+                    "Business Reason": obj.get("reason", raw),
+                    "Potential Impact": obj.get("impact", "—"),
+                    "Confidence": f"{obj.get('confidence', 60)}%",
+                    "Recommended Action": obj.get("action", "—")})
+            else:
+                opp_rows.append({"Opportunity": "Opportunity", "Product/Customer": f_product,
+                                 "Business Reason": raw, "Potential Impact": "—",
+                                 "Confidence": "—", "Recommended Action": "—"})
+        if opp_rows:
+            st.dataframe(pd.DataFrame(opp_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No opportunities cleared the significance filter for this scope.")
+    else:
+        st.info("No opportunity signals detected from current data/scope.")
+    divider()
+
+    # ── 18. MARKET RISK DETECTOR ──
+    section("⚠️", "Market Risk Intelligence")
+    risk_signals = []
+    if scope_fc and not scope_fc.get("insufficient"):
+        if scope_fc["slope"] < 0:
+            risk_signals.append(("Demand Decline", f_product,
+                                 f"Demand trending down {scope_fc['slope']:+.1f} units/mo."))
+        if scope_fc["r2"] < 0.3:
+            risk_signals.append(("Demand Volatility", f_product,
+                                 f"Low forecast fit (R² {scope_fc['r2']:.2f}) — unstable demand."))
+    if has_demand and "CUSTOMER_ID" in demand_df.columns and demand_df["CUSTOMER_ID"].notna().any():
+        share = demand_df.groupby("CUSTOMER_ID")["QUANTITY"].sum()
+        if share.sum() > 0:
+            top_share = share.max() / share.sum() * 100
+            if top_share > 30:
+                risk_signals.append(("Customer Dependency", share.idxmax(),
+                                     f"Top customer is {top_share:.0f}% of total demand."))
+    if not cap_df9.empty and "CURRENT_UTILIZATION" in cap_df9.columns:
+        hot = cap_df9[cap_df9["CURRENT_UTILIZATION"] >= 90]
+        if not hot.empty:
+            risk_signals.append(("Capacity Constraint", "Plant",
+                                 f"{hot.shape[0]} plant(s) at ≥90% utilization vs rising demand."))
+    if risk_signals:
+        risk_rows9 = []
+        for rtype, target, detail in risk_signals:
+            sev = ai_classify(
+                f"Risk type {rtype}. Detail: {detail}. Classify severity.",
+                ["Critical", "High", "Medium", "Low"],
+                cache_key=_ai_cache_key("ndm_risk_sev", rtype, detail))
+            act = ai_complete(
+                f"One short recommended action (<15 words) for this market risk: {rtype}. {detail}",
+                cache_key=_ai_cache_key("ndm_risk_act", rtype, detail))
+            risk_rows9.append({
+                "Risk": rtype, "Affected Product/Customer": target, "Severity": sev or "Medium",
+                "Business Impact": detail, "Confidence": "AI", "Recommended Action": act or "Review"})
+        st.dataframe(pd.DataFrame(risk_rows9), use_container_width=True, hide_index=True)
+    else:
+        st.info("No material market risks detected in the current scope.")
+    divider()
+
+    # ── 19. AI MARKET INTELLIGENCE BRIEF ──
+    section("🧠", "AI Market Intelligence Brief")
+    brief_facts = [
+        f"Scope: product={f_product}, customer={f_customer}, region={f_region}, horizon={f_horizon}."]
+    if scope_fc and not scope_fc.get("insufficient"):
+        brief_facts += [
+            f"Recent demand {scope_fc['recent']:,.0f}/mo, forecast avg {scope_fc['fc_avg']:,.0f}/mo, "
+            f"trend slope {scope_fc['slope']:+.1f}, confidence {scope_fc['confidence']:.0f}%."]
+    else:
+        brief_facts.append("No demand forecast available (historical demand data not yet loaded).")
+    if not cap_df9.empty and "AVAILABLE_CAPACITY" in cap_df9.columns:
+        brief_facts.append(f"Spare capacity {cap_df9['AVAILABLE_CAPACITY'].sum():,.0f} units.")
+    brief = ai_complete(
+        "You are a senior pricing/market analyst. Write a concise market briefing (5-7 sentences) "
+        "covering current demand situation, future outlook, revenue outlook, top growth and at-risk "
+        "areas, competitive threat, capacity concern and pricing opportunity. Use ONLY these facts; "
+        "do not invent numbers:\n" + "\n".join(brief_facts),
+        cache_key=_ai_cache_key("ndm_brief", tuple(brief_facts)))
+    if brief:
+        # Unwrap accidental JSON-string / escaped-newline responses
+        _b = brief.strip()
+        if _b.startswith('"') and _b.endswith('"'):
+            try:
+                _b = json.loads(_b)
+            except Exception:
+                _b = _b.strip('"')
+        st.write(_b.replace("\\n", "\n"))
+    else:
+        st.info("AI market brief unavailable — Cortex did not respond. See Cortex AI Diagnostics.")
+    divider()
+
+# ── 20. EXECUTIVE RECOMMENDATIONS ──
+    section("✅", "Executive Recommendations")
+    import re as _re
+
+    _rec_raw = ai_complete(
+        "Based on the facts below, produce 3-5 prioritized recommendations. Return ONLY a JSON array "
+        "of objects with keys: priority (High/Medium/Low), category, action, reason, impact, "
+        "confidence (0-100). No preamble, no markdown.\nFacts:\n" + "\n".join(brief_facts),
+        cache_key=_ai_cache_key("ndm_recs_v2", tuple(brief_facts)))   # NOTE: new cache key
+
+    # Parse: try helper, then extract the first [...] array from any prose.
+    rec_json = parse_ai_json(_rec_raw)
+    if not (isinstance(rec_json, list) and rec_json) and _rec_raw:
+        m = _re.search(r"\[\s*\{.*\}\s*\]", _rec_raw, _re.DOTALL)
+        if m:
+            try:
+                rec_json = json.loads(m.group(0))
+            except Exception:
+                rec_json = None
+
+    rec_tbl = []
+    if isinstance(rec_json, list):
+        for r in rec_json:
+            if isinstance(r, dict):
+                try:
+                    conf = float(str(r.get("confidence", 60)).strip().rstrip("%"))
+                except Exception:
+                    conf = 60.0
+                rec_tbl.append({
+                    "priority": str(r.get("priority", "Medium")).strip(),
+                    "category": str(r.get("category", "—")).strip(),
+                    "action": str(r.get("action") or r.get("recommendation") or "—").strip(),
+                    "reason": str(r.get("reason", "—")).strip(),
+                    "impact": str(r.get("impact", "—")).strip(),
+                    "confidence": max(0.0, min(100.0, conf)),
+                })
+
+    if rec_tbl:
+        _order = {"high": 0, "medium": 1, "low": 2}
+        rec_tbl.sort(key=lambda x: _order.get(x["priority"].lower(), 1))
+        _sty = {"high": ("#EF4444", "🔴", "rgba(239,68,68,0.10)"),
+                "medium": ("#F59E0B", "🟡", "rgba(245,158,11,0.10)"),
+                "low": ("#38BDF8", "🔵", "rgba(56,189,248,0.10)")}
+        for r in rec_tbl:
+            color, icon, bg = _sty.get(r["priority"].lower(), _sty["medium"])
+            st.markdown(f"""
+<div style="border:1px solid rgba(255,255,255,0.08); border-left:4px solid {color};
+            background:{bg}; border-radius:10px; padding:14px 16px; margin-bottom:10px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+    <span style="font-weight:600; color:#E6EDF3;">{icon} {r['action']}</span>
+    <span style="font-size:12px; color:{color}; border:1px solid {color};
+                 border-radius:20px; padding:2px 10px;">{r['priority'].upper()} · {r['category']}</span>
+  </div>
+  <div style="color:#9FB3C8; font-size:13px; margin-bottom:4px;"><b>Why:</b> {r['reason']}</div>
+  <div style="color:#9FB3C8; font-size:13px; margin-bottom:8px;"><b>Impact:</b> {r['impact']}</div>
+  <div style="background:rgba(255,255,255,0.06); border-radius:6px; height:6px; overflow:hidden;">
+    <div style="width:{r['confidence']:.0f}%; height:6px; background:{color};"></div>
+  </div>
+  <div style="text-align:right; font-size:11px; color:#9FB3C8; margin-top:3px;">
+    {r['confidence']:.0f}% confidence</div>
+</div>
+""", unsafe_allow_html=True)
+    else:
+        st.info("Could not parse structured recommendations.")
+        with st.expander("🔧 Debug: raw Cortex response"):
+            st.code(_rec_raw or "(empty)")
+    divider()
+
+
+
+    # ── 21. EXECUTIVE SUMMARY ──
+    section("📋", "Executive Summary")
+    summ = ai_summarize("\n".join(brief_facts),
+                        cache_key=_ai_cache_key("ndm_exec_summary", tuple(brief_facts)))
+    st.text_area(" ", ai_or_fallback(
+        summ,
+        "Demand Health: " + ("forecast available" if scope_fc and not scope_fc.get("insufficient")
+                             else "awaiting real demand history") + "\n" + "\n".join(brief_facts)),
+        height=220, key="ndm_exec_summary_box")
+# ── 22. SAVED FORECAST HISTORY ──
+    divider()
+    section("📜", "Saved Forecast History")
+    hist_fc = _ndm_load(
+        "SELECT RUN_ID, SCOPE_PRODUCT, SCOPE_CUSTOMER, HORIZON, FORECAST_DATE, "
+        "FORECAST_DEMAND, CONFIDENCE_PCT, FORECAST_REVENUE, CREATED_AT "
+        "FROM PRICING_ENGINE_DB.CORE_OUTPUT.DEMAND_FORECAST_RESULTS "
+        "ORDER BY CREATED_AT DESC LIMIT 100")
+    if hist_fc is not None and not hist_fc.empty:
+        st.dataframe(hist_fc, use_container_width=True, hide_index=True)
+    else:
+        st.info("No saved forecasts yet. Use 💾 Save Forecast to Snowflake above.")
+
+
+
 # ──────────────────────────────────────────────
 # FOOTER
 # ──────────────────────────────────────────────
@@ -4310,3 +5131,7 @@ st.markdown("""
     PRICING INTELLIGENCE PLATFORM · POWERED BY SNOWFLAKE CORTEX AI · STREAMLIT-IN-SNOWFLAKE
 </div>
 """, unsafe_allow_html=True)
+
+
+
+
