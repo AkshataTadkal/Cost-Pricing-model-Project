@@ -1255,8 +1255,14 @@ WITH QUALITY_LABELS AS (
         AVG(FIRST_PASS_YIELD) AS AVG_FIRST_PASS_YIELD,
 
         CASE
-            WHEN AVG(SCRAP_RATE) >= 3
-              OR AVG(DEFECT_RATE) >= 5
+            WHEN
+                (
+                    CASE WHEN AVG(SCRAP_RATE) >= 3 THEN 1 ELSE 0 END +
+                    CASE WHEN AVG(DEFECT_RATE) >= 5 THEN 1 ELSE 0 END +
+                    CASE WHEN AVG(FIRST_PASS_YIELD) < 92 THEN 1 ELSE 0 END +
+                    CASE WHEN AVG(UNITS_REJECTED) > 15 THEN 1 ELSE 0 END +
+                    CASE WHEN AVG(UNITS_REWORKED) > 10 THEN 1 ELSE 0 END
+                ) >= 2
             THEN 1
             ELSE 0
         END AS HIGH_SCRAP
@@ -1793,15 +1799,71 @@ DISCRETE_MFG_COST_MODEL.CORE_ML.CSS_PREDICTIONS;
 CREATE OR REPLACE VIEW DISCRETE_MFG_COST_MODEL.CORE_ML.CSS_PREDICTION_INPUT_V AS
 
 SELECT
-TOP_LEVEL_ITEM,
-REVISION,
-TOTAL_COST,
-COMPONENT_COUNT,
-AVG_SUPPLIER_QUALITY,
-AVG_MACHINE_HEALTH,
-AVG_UTILIZATION,
-CHANGE_COUNT,
-ENGINEERING_STABILITY
+    TOP_LEVEL_ITEM,
+    REVISION,
+
+    --------------------------------------------------
+    -- Product Complexity
+    --------------------------------------------------
+    COMPONENT_COUNT,
+    BOM_RELATIONSHIPS,
+    TOTAL_COMPONENT_QTY,
+    MAX_COMPONENT_QTY,
+    TOTAL_OPERATIONS,
+    WORK_CENTER_COUNT,
+
+    --------------------------------------------------
+    -- Manufacturing Cost
+    --------------------------------------------------
+    TOTAL_COST,
+    TOTAL_MATERIAL_COST,
+    LABOR_COST,
+    MACHINE_COST,
+
+    --------------------------------------------------
+    -- Production & Routing
+    --------------------------------------------------
+    TOTAL_PROCESS_TIME,
+    AVG_RUN,
+    AVG_SETUP,
+    WEIGHTED_RUNTIME,
+
+    --------------------------------------------------
+    -- Machine Health
+    --------------------------------------------------
+    AVG_UTILIZATION,
+    AVG_TEMPERATURE,
+    AVG_VIBRATION,
+
+    --------------------------------------------------
+    -- Supplier
+    --------------------------------------------------
+    AVG_SUPPLIER_QUALITY,
+    SUPPLIER_COUNT,
+    SUPPLIER_CONCENTRATION,
+
+    --------------------------------------------------
+    -- Inventory
+    --------------------------------------------------
+    LOW_STOCK_RATIO,
+    WEIGHTED_DAYS_OF_COVER,
+    WEIGHTED_SAFETY_STOCK,
+
+    --------------------------------------------------
+    -- Engineering
+    --------------------------------------------------
+    CHANGE_COUNT,
+    DAYS_SINCE_LAST_CHANGE,
+    ENGINEERING_STABILITY,
+
+    --------------------------------------------------
+    -- Material Price Stability
+    --------------------------------------------------
+    WEIGHTED_PRICE_CHANGE,
+    WEIGHTED_PRICE_VOLATILITY,
+    MAX_PRICE_CHANGE,
+    MAX_PRICE_VOLATILITY
+
 FROM DISCRETE_MFG_COST_MODEL.CORE_FEATURES.FEATURE_CONTEXT_V;
 
 -- =====================================================
@@ -2585,12 +2647,5 @@ CORE_OUTPUT.AI_DECISION_ENGINE_V;
 -- VALIDATION QUERIES
 -- =====================================================
 
-SELECT
-TOP_LEVEL_ITEM,
-REVISION,
-CSS,
-FMIS,
-TDS,
-BMCS,
-AI_RISK_SCORE
-FROM DISCRETE_MFG_COST_MODEL.CORE_OUTPUT.AI_DECISION_ENGINE_V;
+SELECT *
+FROM DISCRETE_MFG_COST_MODEL.CORE_ML.CSS_PREDICTIONS;
