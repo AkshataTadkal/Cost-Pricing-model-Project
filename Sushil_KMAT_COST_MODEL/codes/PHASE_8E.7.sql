@@ -981,6 +981,7 @@ ORDER BY status.RFQ_ID DESC
 LIMIT 20;
 
 USE DATABASE KMAT_COST_MODEL_DB;
+USE SCHEMA CORE_ML;
 
 -- ============================================================
 -- PHASE 8E.9–8E.10 FINAL
