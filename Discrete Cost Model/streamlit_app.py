@@ -1,3 +1,5 @@
+# Discrete Manufacturing Cost Model - Streamlit app with AI-driven cost optimization
+# Co-authored with CoCo
 # =====================================================
 # Discrete Manufacturing Cost Model
 # Premium Glass UI Patch - Enhanced Version
@@ -3257,8 +3259,8 @@ if st.session_state.show_details:
         "Data Quality",
         "Cost Drivers",
         "Simulation",
-        "Data Onboard",
-        "Cost Maintenance"
+        "Data Management",
+        "Data Onboard"
     ]
     
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(tab_labels)
@@ -6385,11 +6387,746 @@ if st.session_state.show_details:
             
                 st.info("No scenarios saved yet.")
 
-
     # =====================================================
-    # TAB 8: DATA ONBOARDING
+    # TAB 8: DATA UPDATE
     # =====================================================
     with tab8:
+        section_header(
+            "Data Management",
+            "Update operational manufacturing data used by AI scoring.",
+            "🛠️"
+        )
+    
+        col1, col2 = st.columns(2)
+    
+        with col1:
+            st.metric("Product", selected)
+    
+        with col2:
+            st.metric("Revision", revision)
+    
+        st.info(
+            """
+            Update operational data for this product.
+    
+            After clicking **Save Changes**, the dashboard will automatically
+            refresh and all AI scores will be recalculated using the latest values.
+            """
+        )
+
+        premium_divider()
+
+        with st.form("data_management_form"):
+            # Machine Health
+            with st.expander("⚙ Machine Health", expanded=True):
+                machine_df = session.sql(f"""
+                    SELECT
+                        MACHINE_ID,
+                        PLANT_ID,
+                        WORK_CENTER,
+                        HEALTH_SCORE,
+                        TEMPERATURE,
+                        VIBRATION_LEVEL,
+                        UTILIZATION_PERCENT,
+                        BREAKDOWN_COUNT,
+                        LAST_MAINTENANCE
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.MACHINE_HEALTH
+                    ORDER BY MACHINE_ID
+                """).to_pandas()
+                
+                if machine_df.empty:
+                    st.info("No machine health records found for this product.")
+                
+                else:
+                    edited_machine = []
+
+                    for _, row in machine_df.iterrows():
+                    
+                        st.markdown(f"### 🔧 {row['MACHINE_ID']}")
+                    
+                        col1, col2 = st.columns(2)
+                    
+                        with col1:
+                            health = st.slider(
+                                "Health Score",
+                                0.0,
+                                100.0,
+                                float(row["HEALTH_SCORE"]),
+                                key=f"health_{row['MACHINE_ID']}"
+                            )
+                    
+                            temperature = st.number_input(
+                                "Temperature (°C)",
+                                value=float(row["TEMPERATURE"]),
+                                key=f"temp_{row['MACHINE_ID']}"
+                            )
+                    
+                            vibration = st.number_input(
+                                "Vibration Level",
+                                value=float(row["VIBRATION_LEVEL"]),
+                                key=f"vibration_{row['MACHINE_ID']}"
+                            )
+                    
+                        with col2:
+                            utilization = st.slider(
+                                "Utilization (%)",
+                                0.0,
+                                100.0,
+                                float(row["UTILIZATION_PERCENT"]),
+                                key=f"util_{row['MACHINE_ID']}"
+                            )
+                    
+                            breakdowns = st.number_input(
+                                "Breakdown Count",
+                                min_value=0,
+                                value=int(row["BREAKDOWN_COUNT"]),
+                                key=f"break_{row['MACHINE_ID']}"
+                            )
+                    
+                            maintenance = st.date_input(
+                                "Last Maintenance",
+                                value=row["LAST_MAINTENANCE"],
+                                key=f"maint_{row['MACHINE_ID']}"
+                            )
+                    
+                        edited_machine.append({
+                            "machine_id": row["MACHINE_ID"],
+                            "health_score": health,
+                            "temperature": temperature,
+                            "vibration_level": vibration,
+                            "utilization_percent": utilization,
+                            "breakdown_count": breakdowns,
+                            "last_maintenance": maintenance
+                        })
+                    
+                        st.divider()
+    
+            # Production History
+            with st.expander("🏭 Production History"):
+                production_df = session.sql(f"""
+                    SELECT
+                        RUN_ID,
+                        ITEM_ID,
+                        ROUTING_ID,
+                        OPERATOR_ID,
+                        PRODUCED_QTY,
+                        GOOD_QTY,
+                        SCRAP_QTY,
+                        START_TIME,
+                        END_TIME
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.PRODUCTION_HISTORY
+                    WHERE ITEM_ID = '{selected}'
+                    ORDER BY START_TIME DESC
+                """).to_pandas()
+                
+                if production_df.empty:
+                    st.info("No production history found for this product.")
+                else:
+                    edited_production = []
+                
+                    for _, row in production_df.iterrows():
+                
+                        st.markdown(f"### 🏭 Run {row['RUN_ID']}")
+                        st.caption(
+                            f"Operator: {row['OPERATOR_ID']} | Routing: {row['ROUTING_ID']}"
+                        )
+                
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            produced = st.number_input(
+                                "Produced Qty",
+                                min_value=0,
+                                value=int(row["PRODUCED_QTY"]),
+                                key=f"prod_{row['RUN_ID']}"
+                            )
+                        
+                            good = st.number_input(
+                                "Good Qty",
+                                min_value=0,
+                                value=int(row["GOOD_QTY"]),
+                                key=f"good_{row['RUN_ID']}"
+                            )
+                        
+                            scrap = st.number_input(
+                                "Scrap Qty",
+                                min_value=0,
+                                value=int(row["SCRAP_QTY"]),
+                                key=f"scrap_{row['RUN_ID']}"
+                            )
+                        
+                        with col2:
+                            st.metric("Start Time", str(row["START_TIME"]))
+                            st.metric("End Time", str(row["END_TIME"]))
+                
+                        edited_production.append({
+                            "run_id": row["RUN_ID"],
+                            "produced_qty": produced,
+                            "good_qty": good,
+                            "scrap_qty": scrap,
+                        })
+                
+                        st.divider()
+    
+            # Quality History
+            with st.expander("✅ Quality History"):
+                production_quality_df = session.sql(f"""
+                    SELECT
+                        BATCH_ID,
+                        ITEM_ID,
+                        DEFECT_CATEGORY,
+                        DEFECT_RATE,
+                        FIRST_PASS_YIELD,
+                        PRODUCTION_DATE,
+                        SCRAP_RATE,
+                        UNITS_PRODUCED,
+                        UNITS_PASSED,
+                        UNITS_REJECTED,
+                        UNITS_REWORKED
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.QUALITY_HISTORY
+                    WHERE ITEM_ID = '{selected}'
+                    ORDER BY PRODUCTION_DATE DESC
+                """).to_pandas()
+
+                if production_quality_df.empty:
+                    st.info("No quality history found for this product.")
+
+                else:
+                    edited_quality = []
+                
+                    for _, row in production_quality_df.iterrows():
+                
+                        st.markdown(f"### ✅ Batch {row['BATCH_ID']}")
+                        st.caption(f"Defect Category: {row['DEFECT_CATEGORY']}")
+                
+                        col1, col2 = st.columns(2)
+                
+                        with col1:
+                
+                            produced = st.number_input(
+                                "Units Produced",
+                                min_value=0,
+                                value=int(row["UNITS_PRODUCED"]),
+                                key=f"q_prod_{row['BATCH_ID']}"
+                            )
+                
+                            passed = st.number_input(
+                                "Units Passed",
+                                min_value=0,
+                                value=int(row["UNITS_PASSED"]),
+                                key=f"q_pass_{row['BATCH_ID']}"
+                            )
+                
+                            rejected = st.number_input(
+                                "Units Rejected",
+                                min_value=0,
+                                value=int(row["UNITS_REJECTED"]),
+                                key=f"q_reject_{row['BATCH_ID']}"
+                            )
+                
+                            reworked = st.number_input(
+                                "Units Reworked",
+                                min_value=0,
+                                value=int(row["UNITS_REWORKED"]),
+                                key=f"q_rework_{row['BATCH_ID']}"
+                            )
+                
+                        with col2:
+                
+                            defect_rate = st.number_input(
+                                "Defect Rate",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["DEFECT_RATE"]),
+                                key=f"q_defect_{row['BATCH_ID']}"
+                            )
+                
+                            first_pass = st.number_input(
+                                "First Pass Yield",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["FIRST_PASS_YIELD"]),
+                                key=f"q_fpy_{row['BATCH_ID']}"
+                            )
+                
+                            scrap_rate = st.number_input(
+                                "Scrap Rate",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["SCRAP_RATE"]),
+                                key=f"q_scrap_{row['BATCH_ID']}"
+                            )
+                
+                            production_date = st.date_input(
+                                "Production Date",
+                                value=row["PRODUCTION_DATE"],
+                                key=f"q_date_{row['BATCH_ID']}"
+                            )
+                
+                        edited_quality.append({
+                            "batch_id": row["BATCH_ID"],
+                            "units_produced": produced,
+                            "units_passed": passed,
+                            "units_rejected": rejected,
+                            "units_reworked": reworked,
+                            "defect_rate": defect_rate,
+                            "first_pass_yield": first_pass,
+                            "scrap_rate": scrap_rate,
+                            "production_date": production_date
+                        })
+                
+                        st.divider()
+    
+            # Supplier Performance
+            with st.expander("🚚 Supplier Performance"):
+            
+                supplier_df = session.sql("""
+                    SELECT
+                        SUPPLIER_ID,
+                        DELIVERY_DATE,
+                        ON_TIME_PERCENT,
+                        QUALITY_SCORE,
+                        DEFECT_RATE,
+                        LOT_ACCEPTANCE_RATE
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.SUPPLIER_PERFORMANCE
+                    ORDER BY DELIVERY_DATE DESC
+                """).to_pandas()
+            
+                if supplier_df.empty:
+                    st.info("No supplier performance records found.")
+            
+                else:
+            
+                    edited_supplier = []
+            
+                    for _, row in supplier_df.iterrows():
+            
+                        st.markdown(f"### 🚚 Supplier {row['SUPPLIER_ID']}")
+            
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+            
+                            on_time = st.number_input(
+                                "On-Time Delivery (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["ON_TIME_PERCENT"]),
+                                key=f"ontime_{row['SUPPLIER_ID']}_{row['DELIVERY_DATE']}"
+                            )
+            
+                            quality = st.number_input(
+                                "Quality Score",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["QUALITY_SCORE"]),
+                                key=f"quality_{row['SUPPLIER_ID']}_{row['DELIVERY_DATE']}"
+                            )
+            
+                        with col2:
+            
+                            defect = st.number_input(
+                                "Defect Rate",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["DEFECT_RATE"]),
+                                key=f"defect_{row['SUPPLIER_ID']}_{row['DELIVERY_DATE']}"
+                            )
+            
+                            acceptance = st.number_input(
+                                "Lot Acceptance Rate",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(row["LOT_ACCEPTANCE_RATE"]),
+                                key=f"accept_{row['SUPPLIER_ID']}_{row['DELIVERY_DATE']}"
+                            )
+            
+                            delivery = st.date_input(
+                                "Delivery Date",
+                                value=row["DELIVERY_DATE"],
+                                key=f"delivery_{row['SUPPLIER_ID']}_{row['DELIVERY_DATE']}"
+                            )
+            
+                        edited_supplier.append({
+                            "supplier_id": row["SUPPLIER_ID"],
+                            "delivery_date": delivery,
+                            "on_time_percent": on_time,
+                            "quality_score": quality,
+                            "defect_rate": defect,
+                            "lot_acceptance_rate": acceptance
+                        })
+            
+                        st.divider()
+                
+    
+            # Material Properties
+            with st.expander("📦 Material Properties"):
+                material_df = session.sql(f"""
+                    SELECT
+                        ITEM_ID,
+                        MATERIAL_TYPE,
+                        CRITICALITY,
+                        TOLERANCE_CLASS,
+                        DENSITY,
+                        HARDNESS,
+                        FRAGILITY_SCORE
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.MATERIAL_PROPERTIES
+                    WHERE ITEM_ID = '{selected}'
+                """).to_pandas()
+            
+                if material_df.empty:
+                    st.info("No material properties found for this product.")
+            
+                else:
+                    edited_material = []
+            
+                    for _, row in material_df.iterrows():
+            
+                        st.markdown(f"### 📦 {row['ITEM_ID']}")
+                        st.caption(
+                            f"Material Type: {row['MATERIAL_TYPE']} | "
+                            f"Criticality: {row['CRITICALITY']} | "
+                            f"Tolerance Class: {row['TOLERANCE_CLASS']}"
+                        )
+            
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+            
+                            density = st.number_input(
+                                "Density",
+                                min_value=0.0,
+                                value=float(row["DENSITY"]),
+                                key=f"density_{row['ITEM_ID']}"
+                            )
+            
+                        with col2:
+            
+                            hardness = st.number_input(
+                                "Hardness",
+                                min_value=0.0,
+                                value=float(row["HARDNESS"]),
+                                key=f"hardness_{row['ITEM_ID']}"
+                            )
+            
+                            fragility = st.slider(
+                                "Fragility Score",
+                                0.0,
+                                100.0,
+                                float(row["FRAGILITY_SCORE"]),
+                                key=f"fragility_{row['ITEM_ID']}"
+                            )
+            
+                        edited_material.append({
+                            "item_id": row["ITEM_ID"],
+                            "density": density,
+                            "hardness": hardness,
+                            "fragility_score": fragility
+                        })
+            
+                        st.divider()
+    
+            # Engineering Changes
+            with st.expander("📝 Engineering Changes"):
+            
+                ecn_df = session.sql(f"""
+                    SELECT
+                        ECN_ID,
+                        ITEM_ID,
+                        REVISION,
+                        CHANGE_REASON,
+                        CHANGE_DATE,
+                        AFFECTED_COMPONENTS
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.ENGINEERING_CHANGE
+                    WHERE ITEM_ID = '{selected}'
+                    ORDER BY CHANGE_DATE DESC
+                """).to_pandas()
+            
+                if ecn_df.empty:
+                    st.info("No engineering changes found for this product.")
+            
+                else:
+            
+                    edited_ecn = []
+            
+                    for _, row in ecn_df.iterrows():
+            
+                        st.markdown(f"### 📝 {row['ECN_ID']}")
+                        st.caption(f"Revision: {row['REVISION']}")
+            
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+            
+                            affected = st.number_input(
+                                "Affected Components",
+                                min_value=0,
+                                value=int(row["AFFECTED_COMPONENTS"]),
+                                key=f"affected_{row['ECN_ID']}"
+                            )
+            
+                            change_date = st.date_input(
+                                "Change Date",
+                                value=row["CHANGE_DATE"],
+                                key=f"date_{row['ECN_ID']}"
+                            )
+            
+                        with col2:
+            
+                            reason = st.text_area(
+                                "Change Reason",
+                                value=row["CHANGE_REASON"],
+                                key=f"reason_{row['ECN_ID']}"
+                            )
+            
+                        edited_ecn.append({
+                            "ecn_id": row["ECN_ID"],
+                            "affected_components": affected,
+                            "change_date": change_date,
+                            "change_reason": reason
+                        })
+            
+                        st.divider()
+    
+            # Inventory History
+            with st.expander("📊 Inventory History"):
+            
+                inventory_df = session.sql(f"""
+                    SELECT
+                        ITEM_ID,
+                        STOCK_QTY,
+                        SAFETY_STOCK,
+                        DAYS_OF_COVER,
+                        CREATED_AT
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.INVENTORY_HISTORY
+                    WHERE ITEM_ID = '{selected}'
+                """).to_pandas()
+            
+                if inventory_df.empty:
+                    st.info("No inventory history found for this product.")
+            
+                else:
+            
+                    edited_inventory = []
+            
+                    for _, row in inventory_df.iterrows():
+            
+                        st.markdown(f"### 📦 {row['ITEM_ID']}")
+            
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+            
+                            stock = st.number_input(
+                                "Stock Quantity",
+                                min_value=0,
+                                value=int(row["STOCK_QTY"]),
+                                key=f"stock_{row['ITEM_ID']}"
+                            )
+            
+                            safety = st.number_input(
+                                "Safety Stock",
+                                min_value=0,
+                                value=int(row["SAFETY_STOCK"]),
+                                key=f"safety_{row['ITEM_ID']}"
+                            )
+            
+                        with col2:
+            
+                            days = st.number_input(
+                                "Days of Cover",
+                                min_value=0.0,
+                                value=float(row["DAYS_OF_COVER"]),
+                                key=f"cover_{row['ITEM_ID']}"
+                            )
+            
+                            st.metric(
+                                "Created At",
+                                str(row["CREATED_AT"])
+                            )
+            
+                        edited_inventory.append({
+                            "item_id": row["ITEM_ID"],
+                            "stock_qty": stock,
+                            "safety_stock": safety,
+                            "days_of_cover": days
+                        })
+            
+                        st.divider()
+    
+            # Quality Inspection
+            with st.expander("🔍 Quality Inspection"):
+            
+                inspection_df = session.sql(f"""
+                    SELECT
+                        INSPECTION_ID,
+                        ITEM_ID,
+                        OPERATION_ID,
+                        INSPECTION_STAGE,
+                        INSPECTOR,
+                        DEFECT_TYPE,
+                        RESULT,
+                        CREATED_AT
+                    FROM DISCRETE_MFG_COST_MODEL.CORE_INPUT.QUALITY_INSPECTION
+                    WHERE ITEM_ID = '{selected}'
+                    ORDER BY CREATED_AT DESC
+                """).to_pandas()
+            
+                if inspection_df.empty:
+                    st.info("No quality inspection records found.")
+            
+                else:
+            
+                    edited_inspection = []
+            
+                    for _, row in inspection_df.iterrows():
+            
+                        st.markdown(f"### 🔍 Inspection {row['INSPECTION_ID']}")
+                        st.caption(
+                            f"Stage: {row['INSPECTION_STAGE']} | "
+                            f"Inspector: {row['INSPECTOR']}"
+                        )
+            
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+            
+                            defect = st.text_input(
+                                "Defect Type",
+                                value=row["DEFECT_TYPE"],
+                                key=f"defect_{row['INSPECTION_ID']}"
+                            )
+            
+                            result = st.selectbox(
+                                "Inspection Result",
+                                ["PASS", "FAIL", "REWORK"],
+                                index=["PASS", "FAIL", "REWORK"].index(row["RESULT"]),
+                                key=f"result_{row['INSPECTION_ID']}"
+                            )
+            
+                        with col2:
+            
+                            st.metric("Operation", row["OPERATION_ID"])
+                            st.metric("Created At", str(row["CREATED_AT"]))
+            
+                        edited_inspection.append({
+                            "inspection_id": row["INSPECTION_ID"],
+                            "defect_type": defect,
+                            "result": result
+                        })
+            
+                        st.divider()
+    
+            submitted = st.form_submit_button(
+                "💾 Save Changes",
+                use_container_width=True
+            )
+
+            if submitted:
+                try:
+                    for machine in edited_machine:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.MACHINE_HEALTH
+                            SET
+                                HEALTH_SCORE = {machine["health_score"]},
+                                TEMPERATURE = {machine["temperature"]},
+                                VIBRATION_LEVEL = {machine["vibration_level"]},
+                                UTILIZATION_PERCENT = {machine["utilization_percent"]},
+                                BREAKDOWN_COUNT = {machine["breakdown_count"]},
+                                LAST_MAINTENANCE = '{machine["last_maintenance"]}'
+                            WHERE MACHINE_ID = '{machine["machine_id"]}'
+                        """).collect()
+
+                    for production in edited_production:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.PRODUCTION_HISTORY
+                            SET
+                                PRODUCED_QTY = {production["produced_qty"]},
+                                GOOD_QTY = {production["good_qty"]},
+                                SCRAP_QTY = {production["scrap_qty"]},
+                            WHERE RUN_ID = '{production["run_id"]}'
+                        """).collect()
+
+                    for quality in edited_quality:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.QUALITY_HISTORY
+                            SET
+                                UNITS_PRODUCED = {quality["units_produced"]},
+                                UNITS_PASSED = {quality["units_passed"]},
+                                UNITS_REJECTED = {quality["units_rejected"]},
+                                UNITS_REWORKED = {quality["units_reworked"]},
+                                DEFECT_RATE = {quality["defect_rate"]},
+                                FIRST_PASS_YIELD = {quality["first_pass_yield"]},
+                                SCRAP_RATE = {quality["scrap_rate"]},
+                                PRODUCTION_DATE = '{quality["production_date"]}'
+                            WHERE BATCH_ID = '{quality["batch_id"]}'
+                        """).collect()
+
+                    for supplier in edited_supplier:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.SUPPLIER_PERFORMANCE
+                            SET
+                                DELIVERY_DATE = '{supplier["delivery_date"]}',
+                                ON_TIME_PERCENT = {supplier["on_time_percent"]},
+                                QUALITY_SCORE = {supplier["quality_score"]},
+                                DEFECT_RATE = {supplier["defect_rate"]},
+                                LOT_ACCEPTANCE_RATE = {supplier["lot_acceptance_rate"]}
+                            WHERE SUPPLIER_ID = '{supplier["supplier_id"]}'
+                        """).collect()
+
+                    for material in edited_material:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.MATERIAL_PROPERTIES
+                            SET
+                                DENSITY = {material["density"]},
+                                HARDNESS = {material["hardness"]},
+                                FRAGILITY_SCORE = {material["fragility_score"]}
+                            WHERE ITEM_ID = '{material["item_id"]}'
+                        """).collect()
+
+                    for ecn in edited_ecn:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.ENGINEERING_CHANGE
+                            SET
+                                AFFECTED_COMPONENTS = {ecn["affected_components"]},
+                                CHANGE_DATE = '{ecn["change_date"]}',
+                                CHANGE_REASON = '{ecn["change_reason"]}'
+                            WHERE ECN_ID = '{ecn["ecn_id"]}'
+                        """).collect()
+
+                    for inventory in edited_inventory:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.INVENTORY_HISTORY
+                            SET
+                                STOCK_QTY = {inventory["stock_qty"]},
+                                SAFETY_STOCK = {inventory["safety_stock"]},
+                                DAYS_OF_COVER = {inventory["days_of_cover"]}
+                            WHERE ITEM_ID = '{inventory["item_id"]}'
+                        """).collect()
+
+                    for inspection in edited_inspection:
+                        session.sql(f"""
+                            UPDATE DISCRETE_MFG_COST_MODEL.CORE_INPUT.QUALITY_INSPECTION
+                            SET
+                                DEFECT_TYPE = '{inspection["defect_type"]}',
+                                RESULT = '{inspection["result"]}'
+                            WHERE INSPECTION_ID = '{inspection["inspection_id"]}'
+                        """).collect()
+            
+                    session.sql("COMMIT").collect()
+            
+                    st.success("Data updated successfully!")
+            
+                    st.rerun()
+            
+                except Exception as e:
+                    st.error(f"Update failed: {e}")
+
+            
+    # =====================================================
+    # TAB 9: DATA ONBOARDING
+    # =====================================================
+    with tab9:
         section_header(
             "Data Onboarding",
             "Upload and validate manufacturing data",
