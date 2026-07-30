@@ -1,3 +1,5 @@
+-- Phase 9 ML decision governance: policy, audit, override, and review procedures
+-- Co-authored with CoCo
 USE ROLE SYSADMIN;
 USE WAREHOUSE KMAT_WH;
 USE DATABASE KMAT_COST_MODEL_DB;
@@ -212,4 +214,2785 @@ WHERE POLICY_STATUS = 'ACTIVE';
 -- policy. Current SHADOW policies always preserve the existing
 -- deterministic or Phase 7 official result.
 -- ============================================================
+USE DATABASE KMAT_COST_MODEL_DB;
+USE SCHEMA CORE_ML;
 
+CREATE OR REPLACE PROCEDURE RESOLVE_KMAT_ML_DECISION_V1(
+    P_DECISION_ID VARCHAR,
+    P_ENTITY_ID VARCHAR,
+    P_RFQ_ID VARCHAR,
+    P_SIMULATION_ID VARCHAR,
+    P_MODEL_DOMAIN VARCHAR,
+
+    P_RULE_VALUE FLOAT,
+    P_RAW_ML_VALUE FLOAT,
+    P_RECOMMENDED_ML_VALUE FLOAT,
+    P_OFFICIAL_TEXT_STATUS VARCHAR,
+
+    P_FEATURE_QUALITY_PASS_FLAG BOOLEAN,
+    P_MODEL_OOD_FLAG BOOLEAN,
+    P_MODEL_INFERENCE_SUCCESS_FLAG BOOLEAN,
+    P_ENGINEER_APPROVAL_FLAG BOOLEAN,
+    P_ESTIMATED_COST_IMPACT_PCT FLOAT,
+
+    P_MODEL_NAME VARCHAR,
+    P_MODEL_VERSION VARCHAR,
+    P_FEATURE_SET_VERSION VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    V_POLICY_ID VARCHAR;
+    V_POLICY_VERSION VARCHAR;
+    V_DEPLOYMENT_MODE VARCHAR;
+    V_DECISION_TYPE VARCHAR;
+    V_QUALITY_PASS_REQUIRED BOOLEAN;
+    V_OOD_USE_ALLOWED BOOLEAN;
+    V_AUTO_USE_ALLOWED BOOLEAN;
+    V_COST_IMPACT_ALLOWED BOOLEAN;
+    V_BUSINESS_DECISION_ALLOWED BOOLEAN;
+    V_FALLBACK_SOURCE VARCHAR;
+
+    V_ML_INPUT_STATUS VARCHAR DEFAULT ''VALID'';
+    V_DECISION_STATUS VARCHAR;
+    V_DECISION_SOURCE VARCHAR;
+    V_FALLBACK_REASON VARCHAR DEFAULT NULL;
+    V_FINAL_NUMERIC_VALUE FLOAT;
+    V_FINAL_TEXT_STATUS VARCHAR;
+    V_ML_VALUE_ACCEPTED BOOLEAN DEFAULT FALSE;
+    V_EFF_COST_IMPACT_ALLOWED BOOLEAN DEFAULT FALSE;
+    V_EFF_BUSINESS_DECISION_ALLOWED BOOLEAN DEFAULT FALSE;
+
+    V_POLICY_COUNT NUMBER DEFAULT 0;
+BEGIN
+    -- Look up active policy for this domain
+    SELECT COUNT(*)
+    INTO :V_POLICY_COUNT
+    FROM VW_ML_DECISION_POLICY_CURRENT_V1
+    WHERE MODEL_DOMAIN = UPPER(:P_MODEL_DOMAIN);
+
+    IF (V_POLICY_COUNT <> 1) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''No active policy for domain.'',
+            ''model_domain'', P_MODEL_DOMAIN
+        );
+    END IF;
+
+    SELECT
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+        DECISION_TYPE,
+        QUALITY_PASS_REQUIRED_FLAG,
+        OOD_USE_ALLOWED_FLAG,
+        AUTO_USE_ALLOWED_FLAG,
+        OFFICIAL_COST_IMPACT_ALLOWED_FLAG,
+        BUSINESS_DECISION_ALLOWED_FLAG,
+        FALLBACK_SOURCE
+    INTO
+        :V_POLICY_ID,
+        :V_POLICY_VERSION,
+        :V_DEPLOYMENT_MODE,
+        :V_DECISION_TYPE,
+        :V_QUALITY_PASS_REQUIRED,
+        :V_OOD_USE_ALLOWED,
+        :V_AUTO_USE_ALLOWED,
+        :V_COST_IMPACT_ALLOWED,
+        :V_BUSINESS_DECISION_ALLOWED,
+        :V_FALLBACK_SOURCE
+    FROM VW_ML_DECISION_POLICY_CURRENT_V1
+    WHERE MODEL_DOMAIN = UPPER(:P_MODEL_DOMAIN);
+
+    -- Evaluate ML input quality
+    IF (V_QUALITY_PASS_REQUIRED AND NOT P_FEATURE_QUALITY_PASS_FLAG) THEN
+        V_ML_INPUT_STATUS := ''QUALITY_FAIL'';
+        V_FALLBACK_REASON := ''Feature quality check failed.'';
+    ELSEIF (NOT V_OOD_USE_ALLOWED AND P_MODEL_OOD_FLAG) THEN
+        V_ML_INPUT_STATUS := ''OOD_REJECT'';
+        V_FALLBACK_REASON := ''Model out-of-distribution and OOD use not allowed.'';
+    ELSEIF (NOT P_MODEL_INFERENCE_SUCCESS_FLAG) THEN
+        V_ML_INPUT_STATUS := ''INFERENCE_FAIL'';
+        V_FALLBACK_REASON := ''Model inference did not succeed.'';
+    END IF;
+
+    -- Resolve final value based on deployment mode
+    IF (V_DEPLOYMENT_MODE = ''SHADOW'') THEN
+        -- Shadow mode: always fall back to rule value
+        V_FINAL_NUMERIC_VALUE := P_RULE_VALUE;
+        V_FINAL_TEXT_STATUS := P_OFFICIAL_TEXT_STATUS;
+        V_DECISION_STATUS := ''SHADOW_RECORDED'';
+        V_DECISION_SOURCE := V_FALLBACK_SOURCE;
+        V_ML_VALUE_ACCEPTED := FALSE;
+        V_EFF_COST_IMPACT_ALLOWED := FALSE;
+        V_EFF_BUSINESS_DECISION_ALLOWED := FALSE;
+        IF (V_FALLBACK_REASON IS NULL) THEN
+            V_FALLBACK_REASON := ''Policy deployment mode is SHADOW.'';
+        END IF;
+    ELSEIF (V_ML_INPUT_STATUS <> ''VALID'') THEN
+        -- Input invalid: fall back to rule
+        V_FINAL_NUMERIC_VALUE := P_RULE_VALUE;
+        V_FINAL_TEXT_STATUS := P_OFFICIAL_TEXT_STATUS;
+        V_DECISION_STATUS := ''FALLBACK'';
+        V_DECISION_SOURCE := V_FALLBACK_SOURCE;
+        V_ML_VALUE_ACCEPTED := FALSE;
+        V_EFF_COST_IMPACT_ALLOWED := FALSE;
+        V_EFF_BUSINESS_DECISION_ALLOWED := FALSE;
+    ELSEIF (V_AUTO_USE_ALLOWED) THEN
+        -- Auto-use: accept ML recommendation
+        V_FINAL_NUMERIC_VALUE := P_RECOMMENDED_ML_VALUE;
+        V_FINAL_TEXT_STATUS := P_OFFICIAL_TEXT_STATUS;
+        V_DECISION_STATUS := ''ML_ACCEPTED'';
+        V_DECISION_SOURCE := ''ML_MODEL'';
+        V_ML_VALUE_ACCEPTED := TRUE;
+        V_EFF_COST_IMPACT_ALLOWED := V_COST_IMPACT_ALLOWED;
+        V_EFF_BUSINESS_DECISION_ALLOWED := V_BUSINESS_DECISION_ALLOWED;
+    ELSE
+        -- Requires engineer approval
+        V_FINAL_NUMERIC_VALUE := P_RULE_VALUE;
+        V_FINAL_TEXT_STATUS := P_OFFICIAL_TEXT_STATUS;
+        V_DECISION_STATUS := ''PENDING_ENGINEER_APPROVAL'';
+        V_DECISION_SOURCE := V_FALLBACK_SOURCE;
+        V_ML_VALUE_ACCEPTED := FALSE;
+        V_EFF_COST_IMPACT_ALLOWED := FALSE;
+        V_EFF_BUSINESS_DECISION_ALLOWED := FALSE;
+        V_FALLBACK_REASON := ''Engineer approval required.'';
+    END IF;
+
+    -- Upsert into decision result table (idempotent by DECISION_ID)
+    MERGE INTO ML_DECISION_RESULT_V1 target
+    USING (
+        SELECT :P_DECISION_ID AS DECISION_ID
+    ) source
+    ON target.DECISION_ID = source.DECISION_ID
+    WHEN MATCHED THEN UPDATE SET
+        ENTITY_ID = :P_ENTITY_ID,
+        RFQ_ID = :P_RFQ_ID,
+        SIMULATION_ID = :P_SIMULATION_ID,
+        MODEL_DOMAIN = UPPER(:P_MODEL_DOMAIN),
+        POLICY_ID = :V_POLICY_ID,
+        POLICY_VERSION = :V_POLICY_VERSION,
+        DEPLOYMENT_MODE = :V_DEPLOYMENT_MODE,
+        DECISION_TYPE = :V_DECISION_TYPE,
+        MODEL_NAME = :P_MODEL_NAME,
+        MODEL_VERSION = :P_MODEL_VERSION,
+        FEATURE_SET_VERSION = :P_FEATURE_SET_VERSION,
+        RULE_VALUE = :P_RULE_VALUE,
+        RAW_ML_VALUE = :P_RAW_ML_VALUE,
+        RECOMMENDED_ML_VALUE = :P_RECOMMENDED_ML_VALUE,
+        FINAL_NUMERIC_VALUE = :V_FINAL_NUMERIC_VALUE,
+        OFFICIAL_TEXT_STATUS = :P_OFFICIAL_TEXT_STATUS,
+        FINAL_TEXT_STATUS = :V_FINAL_TEXT_STATUS,
+        FEATURE_QUALITY_PASS_FLAG = :P_FEATURE_QUALITY_PASS_FLAG,
+        MODEL_OOD_FLAG = :P_MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG = :P_MODEL_INFERENCE_SUCCESS_FLAG,
+        ENGINEER_APPROVAL_FLAG = :P_ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT = :P_ESTIMATED_COST_IMPACT_PCT,
+        ML_INPUT_STATUS = :V_ML_INPUT_STATUS,
+        DECISION_STATUS = :V_DECISION_STATUS,
+        DECISION_SOURCE = :V_DECISION_SOURCE,
+        FALLBACK_REASON = :V_FALLBACK_REASON,
+        ML_VALUE_ACCEPTED_FLAG = :V_ML_VALUE_ACCEPTED,
+        EFFECTIVE_COST_IMPACT_ALLOWED_FLAG = :V_EFF_COST_IMPACT_ALLOWED,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG = :V_EFF_BUSINESS_DECISION_ALLOWED,
+        UPDATED_AT = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN INSERT (
+        DECISION_ID, ENTITY_ID, RFQ_ID, SIMULATION_ID, MODEL_DOMAIN,
+        POLICY_ID, POLICY_VERSION, DEPLOYMENT_MODE, DECISION_TYPE,
+        MODEL_NAME, MODEL_VERSION, FEATURE_SET_VERSION,
+        RULE_VALUE, RAW_ML_VALUE, RECOMMENDED_ML_VALUE, FINAL_NUMERIC_VALUE,
+        OFFICIAL_TEXT_STATUS, FINAL_TEXT_STATUS,
+        FEATURE_QUALITY_PASS_FLAG, MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG, ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT,
+        ML_INPUT_STATUS, DECISION_STATUS, DECISION_SOURCE, FALLBACK_REASON,
+        ML_VALUE_ACCEPTED_FLAG, EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+    ) VALUES (
+        :P_DECISION_ID, :P_ENTITY_ID, :P_RFQ_ID, :P_SIMULATION_ID,
+        UPPER(:P_MODEL_DOMAIN),
+        :V_POLICY_ID, :V_POLICY_VERSION, :V_DEPLOYMENT_MODE, :V_DECISION_TYPE,
+        :P_MODEL_NAME, :P_MODEL_VERSION, :P_FEATURE_SET_VERSION,
+        :P_RULE_VALUE, :P_RAW_ML_VALUE, :P_RECOMMENDED_ML_VALUE,
+        :V_FINAL_NUMERIC_VALUE,
+        :P_OFFICIAL_TEXT_STATUS, :V_FINAL_TEXT_STATUS,
+        :P_FEATURE_QUALITY_PASS_FLAG, :P_MODEL_OOD_FLAG,
+        :P_MODEL_INFERENCE_SUCCESS_FLAG, :P_ENGINEER_APPROVAL_FLAG,
+        :P_ESTIMATED_COST_IMPACT_PCT,
+        :V_ML_INPUT_STATUS, :V_DECISION_STATUS, :V_DECISION_SOURCE,
+        :V_FALLBACK_REASON,
+        :V_ML_VALUE_ACCEPTED, :V_EFF_COST_IMPACT_ALLOWED,
+        :V_EFF_BUSINESS_DECISION_ALLOWED
+    );
+
+    RETURN OBJECT_CONSTRUCT(
+        ''status'', ''SUCCESS'',
+        ''decision_id'', P_DECISION_ID,
+        ''model_domain'', UPPER(P_MODEL_DOMAIN),
+        ''deployment_mode'', V_DEPLOYMENT_MODE,
+        ''ml_input_status'', V_ML_INPUT_STATUS,
+        ''decision_status'', V_DECISION_STATUS,
+        ''decision_source'', V_DECISION_SOURCE,
+        ''final_numeric_value'', V_FINAL_NUMERIC_VALUE,
+        ''ml_value_accepted'', V_ML_VALUE_ACCEPTED
+    );
+END;
+';
+
+
+-- ============================================================
+-- PHASE 9C — AUDIT AND CONTROLLED OVERRIDES
+--
+-- Scope:
+--   1. Append-only snapshots of governed ML decisions.
+--   2. Two-person override request and review workflow.
+--   3. Approved overrides remain shadow comparison values.
+--
+-- This phase does not alter official cost, trusted-cost status,
+-- or Phase 7 BMCS review results.
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 0. GOVERNED DECISION RESULT TABLE
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ML_DECISION_RESULT_V1 (
+    DECISION_ID VARCHAR NOT NULL,
+    ENTITY_ID VARCHAR NOT NULL,
+    RFQ_ID VARCHAR,
+    SIMULATION_ID VARCHAR,
+    MODEL_DOMAIN VARCHAR NOT NULL,
+
+    POLICY_ID VARCHAR NOT NULL,
+    POLICY_VERSION VARCHAR NOT NULL,
+    DEPLOYMENT_MODE VARCHAR NOT NULL,
+    DECISION_TYPE VARCHAR NOT NULL,
+
+    MODEL_NAME VARCHAR,
+    MODEL_VERSION VARCHAR,
+    FEATURE_SET_VERSION VARCHAR,
+
+    RULE_VALUE FLOAT,
+    RAW_ML_VALUE FLOAT,
+    RECOMMENDED_ML_VALUE FLOAT,
+    FINAL_NUMERIC_VALUE FLOAT,
+
+    OFFICIAL_TEXT_STATUS VARCHAR,
+    FINAL_TEXT_STATUS VARCHAR,
+
+    FEATURE_QUALITY_PASS_FLAG BOOLEAN,
+    MODEL_OOD_FLAG BOOLEAN,
+    MODEL_INFERENCE_SUCCESS_FLAG BOOLEAN,
+    ENGINEER_APPROVAL_FLAG BOOLEAN,
+    ESTIMATED_COST_IMPACT_PCT FLOAT,
+
+    ML_INPUT_STATUS VARCHAR,
+    DECISION_STATUS VARCHAR,
+    DECISION_SOURCE VARCHAR,
+    FALLBACK_REASON VARCHAR,
+
+    ML_VALUE_ACCEPTED_FLAG BOOLEAN,
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG BOOLEAN,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG BOOLEAN,
+
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- ------------------------------------------------------------
+-- 1. APPEND-ONLY DECISION AUDIT
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ML_DECISION_AUDIT_V1 (
+    AUDIT_EVENT_ID VARCHAR NOT NULL,
+    AUDIT_EVENT_TYPE VARCHAR NOT NULL,
+    AUDIT_EVENT_ACTOR VARCHAR NOT NULL,
+    AUDIT_EVENT_REASON VARCHAR,
+
+    DECISION_ID VARCHAR NOT NULL,
+    ENTITY_ID VARCHAR NOT NULL,
+    RFQ_ID VARCHAR,
+    SIMULATION_ID VARCHAR,
+    MODEL_DOMAIN VARCHAR NOT NULL,
+
+    POLICY_ID VARCHAR NOT NULL,
+    POLICY_VERSION VARCHAR NOT NULL,
+    DEPLOYMENT_MODE VARCHAR NOT NULL,
+    DECISION_TYPE VARCHAR NOT NULL,
+
+    MODEL_NAME VARCHAR,
+    MODEL_VERSION VARCHAR,
+    FEATURE_SET_VERSION VARCHAR,
+
+    RULE_VALUE FLOAT,
+    RAW_ML_VALUE FLOAT,
+    RECOMMENDED_ML_VALUE FLOAT,
+    FINAL_NUMERIC_VALUE FLOAT,
+
+    OFFICIAL_TEXT_STATUS VARCHAR,
+    FINAL_TEXT_STATUS VARCHAR,
+
+    FEATURE_QUALITY_PASS_FLAG BOOLEAN,
+    MODEL_OOD_FLAG BOOLEAN,
+    MODEL_INFERENCE_SUCCESS_FLAG BOOLEAN,
+    ENGINEER_APPROVAL_FLAG BOOLEAN,
+    ESTIMATED_COST_IMPACT_PCT FLOAT,
+
+    ML_INPUT_STATUS VARCHAR,
+    DECISION_STATUS VARCHAR,
+    DECISION_SOURCE VARCHAR,
+    FALLBACK_REASON VARCHAR,
+
+    ML_VALUE_ACCEPTED_FLAG BOOLEAN,
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG BOOLEAN,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG BOOLEAN,
+
+    OVERRIDE_ID VARCHAR,
+    OVERRIDE_NUMERIC_VALUE FLOAT,
+    OVERRIDE_TEXT_STATUS VARCHAR,
+    OVERRIDE_STATUS VARCHAR,
+
+    SOURCE_DECISION_CREATED_AT TIMESTAMP_NTZ,
+    SOURCE_DECISION_UPDATED_AT TIMESTAMP_NTZ,
+    AUDITED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- ------------------------------------------------------------
+-- 2. CONTROLLED OVERRIDE TABLE
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ML_DECISION_OVERRIDE_V1 (
+    OVERRIDE_ID VARCHAR NOT NULL,
+    DECISION_ID VARCHAR NOT NULL,
+
+    ENTITY_ID VARCHAR NOT NULL,
+    RFQ_ID VARCHAR,
+    SIMULATION_ID VARCHAR,
+    MODEL_DOMAIN VARCHAR NOT NULL,
+
+    POLICY_ID VARCHAR NOT NULL,
+    POLICY_VERSION VARCHAR NOT NULL,
+    DEPLOYMENT_MODE VARCHAR NOT NULL,
+
+    ORIGINAL_RULE_VALUE FLOAT,
+    ORIGINAL_RECOMMENDED_ML_VALUE FLOAT,
+    ORIGINAL_FINAL_NUMERIC_VALUE FLOAT,
+    ORIGINAL_FINAL_TEXT_STATUS VARCHAR,
+
+    OVERRIDE_NUMERIC_VALUE FLOAT,
+    OVERRIDE_TEXT_STATUS VARCHAR,
+    OVERRIDE_REASON VARCHAR NOT NULL,
+
+    OVERRIDE_STATUS VARCHAR NOT NULL,
+    REQUESTED_BY VARCHAR NOT NULL,
+    REQUESTED_AT TIMESTAMP_NTZ NOT NULL,
+
+    REVIEWED_BY VARCHAR,
+    REVIEWED_AT TIMESTAMP_NTZ,
+    REVIEW_ACTION VARCHAR,
+    REVIEW_NOTE VARCHAR,
+
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG BOOLEAN DEFAULT FALSE,
+
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- ------------------------------------------------------------
+-- 3. EXPLICIT AUDIT-SNAPSHOT PROCEDURE
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE CAPTURE_ML_DECISION_AUDIT_V1(
+    P_DECISION_ID VARCHAR,
+    P_EVENT_TYPE VARCHAR,
+    P_EVENT_ACTOR VARCHAR,
+    P_EVENT_REASON VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    V_DECISION_COUNT NUMBER DEFAULT 0;
+    V_AUDIT_EVENT_ID VARCHAR;
+BEGIN
+    IF (
+        P_DECISION_ID IS NULL
+        OR LENGTH(TRIM(P_DECISION_ID)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_DECISION_ID is required.''
+        );
+    END IF;
+
+    IF (
+        P_EVENT_TYPE IS NULL
+        OR LENGTH(TRIM(P_EVENT_TYPE)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_EVENT_TYPE is required.''
+        );
+    END IF;
+
+    IF (
+        P_EVENT_ACTOR IS NULL
+        OR LENGTH(TRIM(P_EVENT_ACTOR)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_EVENT_ACTOR is required.''
+        );
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_DECISION_COUNT
+    FROM ML_DECISION_RESULT_V1
+    WHERE DECISION_ID = :P_DECISION_ID;
+
+    IF (V_DECISION_COUNT <> 1) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''Exactly one decision must exist before audit capture.'',
+            ''decision_count'', V_DECISION_COUNT
+        );
+    END IF;
+
+    V_AUDIT_EVENT_ID := UUID_STRING();
+
+    INSERT INTO ML_DECISION_AUDIT_V1 (
+        AUDIT_EVENT_ID,
+        AUDIT_EVENT_TYPE,
+        AUDIT_EVENT_ACTOR,
+        AUDIT_EVENT_REASON,
+
+        DECISION_ID,
+        ENTITY_ID,
+        RFQ_ID,
+        SIMULATION_ID,
+        MODEL_DOMAIN,
+
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+        DECISION_TYPE,
+
+        MODEL_NAME,
+        MODEL_VERSION,
+        FEATURE_SET_VERSION,
+
+        RULE_VALUE,
+        RAW_ML_VALUE,
+        RECOMMENDED_ML_VALUE,
+        FINAL_NUMERIC_VALUE,
+
+        OFFICIAL_TEXT_STATUS,
+        FINAL_TEXT_STATUS,
+
+        FEATURE_QUALITY_PASS_FLAG,
+        MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG,
+        ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT,
+
+        ML_INPUT_STATUS,
+        DECISION_STATUS,
+        DECISION_SOURCE,
+        FALLBACK_REASON,
+
+        ML_VALUE_ACCEPTED_FLAG,
+        EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        OVERRIDE_ID,
+        OVERRIDE_NUMERIC_VALUE,
+        OVERRIDE_TEXT_STATUS,
+        OVERRIDE_STATUS,
+
+        SOURCE_DECISION_CREATED_AT,
+        SOURCE_DECISION_UPDATED_AT,
+        AUDITED_AT
+    )
+    SELECT
+        :V_AUDIT_EVENT_ID,
+        UPPER(TRIM(:P_EVENT_TYPE)),
+        TRIM(:P_EVENT_ACTOR),
+        :P_EVENT_REASON,
+
+        DECISION_ID,
+        ENTITY_ID,
+        RFQ_ID,
+        SIMULATION_ID,
+        MODEL_DOMAIN,
+
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+        DECISION_TYPE,
+
+        MODEL_NAME,
+        MODEL_VERSION,
+        FEATURE_SET_VERSION,
+
+        RULE_VALUE::FLOAT,
+        RAW_ML_VALUE::FLOAT,
+        RECOMMENDED_ML_VALUE::FLOAT,
+        FINAL_NUMERIC_VALUE::FLOAT,
+
+        OFFICIAL_TEXT_STATUS,
+        FINAL_TEXT_STATUS,
+
+        FEATURE_QUALITY_PASS_FLAG,
+        MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG,
+        ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT::FLOAT,
+
+        ML_INPUT_STATUS,
+        DECISION_STATUS,
+        DECISION_SOURCE,
+        FALLBACK_REASON,
+
+        ML_VALUE_ACCEPTED_FLAG,
+        EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        NULL,
+        NULL::FLOAT,
+        NULL,
+        NULL,
+
+        CREATED_AT,
+        UPDATED_AT,
+        CURRENT_TIMESTAMP()
+    FROM ML_DECISION_RESULT_V1
+    WHERE DECISION_ID = :P_DECISION_ID;
+
+    RETURN OBJECT_CONSTRUCT(
+        ''status'', ''SUCCESS'',
+        ''audit_event_id'', V_AUDIT_EVENT_ID,
+        ''decision_id'', P_DECISION_ID,
+        ''event_type'', UPPER(TRIM(P_EVENT_TYPE))
+    );
+END;
+';
+
+
+-- ------------------------------------------------------------
+-- 4. OVERRIDE REQUEST PROCEDURE
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE SUBMIT_ML_DECISION_OVERRIDE_V1(
+    P_OVERRIDE_ID VARCHAR,
+    P_DECISION_ID VARCHAR,
+    P_OVERRIDE_NUMERIC_VALUE FLOAT,
+    P_OVERRIDE_TEXT_STATUS VARCHAR,
+    P_REQUESTED_BY VARCHAR,
+    P_OVERRIDE_REASON VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    V_OVERRIDE_COUNT NUMBER DEFAULT 0;
+    V_DECISION_COUNT NUMBER DEFAULT 0;
+    V_PENDING_COUNT NUMBER DEFAULT 0;
+
+    V_ENTITY_ID VARCHAR;
+    V_RFQ_ID VARCHAR;
+    V_SIMULATION_ID VARCHAR;
+    V_MODEL_DOMAIN VARCHAR;
+
+    V_POLICY_ID VARCHAR;
+    V_POLICY_VERSION VARCHAR;
+    V_DEPLOYMENT_MODE VARCHAR;
+
+    V_RULE_VALUE FLOAT;
+    V_RECOMMENDED_ML_VALUE FLOAT;
+    V_FINAL_NUMERIC_VALUE FLOAT;
+    V_FINAL_TEXT_STATUS VARCHAR;
+
+    V_FINAL_VALUE_MIN FLOAT;
+    V_FINAL_VALUE_MAX FLOAT;
+
+    V_AUDIT_EVENT_ID VARCHAR;
+BEGIN
+    IF (
+        P_OVERRIDE_ID IS NULL
+        OR LENGTH(TRIM(P_OVERRIDE_ID)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_OVERRIDE_ID is required.''
+        );
+    END IF;
+
+    IF (
+        P_DECISION_ID IS NULL
+        OR LENGTH(TRIM(P_DECISION_ID)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_DECISION_ID is required.''
+        );
+    END IF;
+
+    IF (
+        P_REQUESTED_BY IS NULL
+        OR LENGTH(TRIM(P_REQUESTED_BY)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_REQUESTED_BY is required.''
+        );
+    END IF;
+
+    IF (
+        P_OVERRIDE_REASON IS NULL
+        OR LENGTH(TRIM(P_OVERRIDE_REASON)) < 10
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''P_OVERRIDE_REASON must contain at least 10 characters.''
+        );
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_OVERRIDE_COUNT
+    FROM ML_DECISION_OVERRIDE_V1
+    WHERE OVERRIDE_ID = :P_OVERRIDE_ID;
+
+    IF (V_OVERRIDE_COUNT > 0) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_OVERRIDE_ID already exists.''
+        );
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_DECISION_COUNT
+    FROM ML_DECISION_RESULT_V1
+    WHERE DECISION_ID = :P_DECISION_ID;
+
+    IF (V_DECISION_COUNT <> 1) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''Exactly one governed decision must exist.'',
+            ''decision_count'', V_DECISION_COUNT
+        );
+    END IF;
+
+    SELECT
+        decision.ENTITY_ID,
+        decision.RFQ_ID,
+        decision.SIMULATION_ID,
+        decision.MODEL_DOMAIN,
+
+        decision.POLICY_ID,
+        decision.POLICY_VERSION,
+        decision.DEPLOYMENT_MODE,
+
+        decision.RULE_VALUE::FLOAT,
+        decision.RECOMMENDED_ML_VALUE::FLOAT,
+        decision.FINAL_NUMERIC_VALUE::FLOAT,
+        decision.FINAL_TEXT_STATUS,
+
+        policy.FINAL_VALUE_MIN::FLOAT,
+        policy.FINAL_VALUE_MAX::FLOAT
+    INTO
+        :V_ENTITY_ID,
+        :V_RFQ_ID,
+        :V_SIMULATION_ID,
+        :V_MODEL_DOMAIN,
+
+        :V_POLICY_ID,
+        :V_POLICY_VERSION,
+        :V_DEPLOYMENT_MODE,
+
+        :V_RULE_VALUE,
+        :V_RECOMMENDED_ML_VALUE,
+        :V_FINAL_NUMERIC_VALUE,
+        :V_FINAL_TEXT_STATUS,
+
+        :V_FINAL_VALUE_MIN,
+        :V_FINAL_VALUE_MAX
+    FROM ML_DECISION_RESULT_V1 decision
+    INNER JOIN ML_DECISION_POLICY_V1 policy
+        ON decision.POLICY_ID = policy.POLICY_ID
+       AND decision.POLICY_VERSION =
+           policy.POLICY_VERSION
+    WHERE decision.DECISION_ID =
+          :P_DECISION_ID;
+
+    IF (V_ENTITY_ID IS NULL) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''Decision policy join failed. Policy may have been retired.'',
+            ''decision_id'', P_DECISION_ID
+        );
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_PENDING_COUNT
+    FROM ML_DECISION_OVERRIDE_V1
+    WHERE DECISION_ID = :P_DECISION_ID
+      AND OVERRIDE_STATUS = ''PENDING_REVIEW'';
+
+    IF (V_PENDING_COUNT > 0) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''A pending override already exists for this decision.''
+        );
+    END IF;
+
+    IF (V_MODEL_DOMAIN = ''BMCS'') THEN
+        IF (
+            P_OVERRIDE_TEXT_STATUS IS NULL
+            OR UPPER(TRIM(P_OVERRIDE_TEXT_STATUS))
+               NOT IN (
+                   ''AUTO_APPROVED'',
+                   ''REVIEW_RECOMMENDED'',
+                   ''REVIEW_REQUIRED''
+               )
+        ) THEN
+            RETURN OBJECT_CONSTRUCT(
+                ''status'', ''ERROR'',
+                ''message'',
+                ''BMCS requires an allowed text review status.''
+            );
+        END IF;
+
+    ELSE
+        IF (P_OVERRIDE_NUMERIC_VALUE IS NULL) THEN
+            RETURN OBJECT_CONSTRUCT(
+                ''status'', ''ERROR'',
+                ''message'',
+                ''Numeric override value is required for CSS, FMIS and TDS.''
+            );
+        END IF;
+
+        IF (
+            V_FINAL_VALUE_MIN IS NOT NULL
+            AND P_OVERRIDE_NUMERIC_VALUE <
+                V_FINAL_VALUE_MIN
+        ) THEN
+            RETURN OBJECT_CONSTRUCT(
+                ''status'', ''ERROR'',
+                ''message'',
+                ''Override value is below the policy minimum.'',
+                ''policy_minimum'', V_FINAL_VALUE_MIN
+            );
+        END IF;
+
+        IF (
+            V_FINAL_VALUE_MAX IS NOT NULL
+            AND P_OVERRIDE_NUMERIC_VALUE >
+                V_FINAL_VALUE_MAX
+        ) THEN
+            RETURN OBJECT_CONSTRUCT(
+                ''status'', ''ERROR'',
+                ''message'',
+                ''Override value is above the policy maximum.'',
+                ''policy_maximum'', V_FINAL_VALUE_MAX
+            );
+        END IF;
+    END IF;
+
+    UPDATE ML_DECISION_OVERRIDE_V1
+    SET
+        OVERRIDE_STATUS = ''SUPERSEDED'',
+        UPDATED_AT = CURRENT_TIMESTAMP()
+    WHERE DECISION_ID = :P_DECISION_ID
+      AND OVERRIDE_STATUS =
+          ''APPROVED_NOT_APPLIED'';
+
+    INSERT INTO ML_DECISION_OVERRIDE_V1 (
+        OVERRIDE_ID,
+        DECISION_ID,
+
+        ENTITY_ID,
+        RFQ_ID,
+        SIMULATION_ID,
+        MODEL_DOMAIN,
+
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+
+        ORIGINAL_RULE_VALUE,
+        ORIGINAL_RECOMMENDED_ML_VALUE,
+        ORIGINAL_FINAL_NUMERIC_VALUE,
+        ORIGINAL_FINAL_TEXT_STATUS,
+
+        OVERRIDE_NUMERIC_VALUE,
+        OVERRIDE_TEXT_STATUS,
+        OVERRIDE_REASON,
+
+        OVERRIDE_STATUS,
+        REQUESTED_BY,
+        REQUESTED_AT,
+
+        OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+
+        CREATED_AT,
+        UPDATED_AT
+    )
+    VALUES (
+        :P_OVERRIDE_ID,
+        :P_DECISION_ID,
+
+        :V_ENTITY_ID,
+        :V_RFQ_ID,
+        :V_SIMULATION_ID,
+        :V_MODEL_DOMAIN,
+
+        :V_POLICY_ID,
+        :V_POLICY_VERSION,
+        :V_DEPLOYMENT_MODE,
+
+        :V_RULE_VALUE,
+        :V_RECOMMENDED_ML_VALUE,
+        :V_FINAL_NUMERIC_VALUE,
+        :V_FINAL_TEXT_STATUS,
+
+        :P_OVERRIDE_NUMERIC_VALUE,
+        UPPER(TRIM(:P_OVERRIDE_TEXT_STATUS)),
+        TRIM(:P_OVERRIDE_REASON),
+
+        ''PENDING_REVIEW'',
+        TRIM(:P_REQUESTED_BY),
+        CURRENT_TIMESTAMP(),
+
+        FALSE,
+
+        CURRENT_TIMESTAMP(),
+        CURRENT_TIMESTAMP()
+    );
+
+    V_AUDIT_EVENT_ID := UUID_STRING();
+
+    INSERT INTO ML_DECISION_AUDIT_V1 (
+        AUDIT_EVENT_ID,
+        AUDIT_EVENT_TYPE,
+        AUDIT_EVENT_ACTOR,
+        AUDIT_EVENT_REASON,
+
+        DECISION_ID,
+        ENTITY_ID,
+        RFQ_ID,
+        SIMULATION_ID,
+        MODEL_DOMAIN,
+
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+        DECISION_TYPE,
+
+        MODEL_NAME,
+        MODEL_VERSION,
+        FEATURE_SET_VERSION,
+
+        RULE_VALUE,
+        RAW_ML_VALUE,
+        RECOMMENDED_ML_VALUE,
+        FINAL_NUMERIC_VALUE,
+
+        OFFICIAL_TEXT_STATUS,
+        FINAL_TEXT_STATUS,
+
+        FEATURE_QUALITY_PASS_FLAG,
+        MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG,
+        ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT,
+
+        ML_INPUT_STATUS,
+        DECISION_STATUS,
+        DECISION_SOURCE,
+        FALLBACK_REASON,
+
+        ML_VALUE_ACCEPTED_FLAG,
+        EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        OVERRIDE_ID,
+        OVERRIDE_NUMERIC_VALUE,
+        OVERRIDE_TEXT_STATUS,
+        OVERRIDE_STATUS,
+
+        SOURCE_DECISION_CREATED_AT,
+        SOURCE_DECISION_UPDATED_AT,
+        AUDITED_AT
+    )
+    SELECT
+        :V_AUDIT_EVENT_ID,
+        ''OVERRIDE_REQUESTED'',
+        TRIM(:P_REQUESTED_BY),
+        TRIM(:P_OVERRIDE_REASON),
+
+        decision.DECISION_ID,
+        decision.ENTITY_ID,
+        decision.RFQ_ID,
+        decision.SIMULATION_ID,
+        decision.MODEL_DOMAIN,
+
+        decision.POLICY_ID,
+        decision.POLICY_VERSION,
+        decision.DEPLOYMENT_MODE,
+        decision.DECISION_TYPE,
+
+        decision.MODEL_NAME,
+        decision.MODEL_VERSION,
+        decision.FEATURE_SET_VERSION,
+
+        decision.RULE_VALUE::FLOAT,
+        decision.RAW_ML_VALUE::FLOAT,
+        decision.RECOMMENDED_ML_VALUE::FLOAT,
+        decision.FINAL_NUMERIC_VALUE::FLOAT,
+
+        decision.OFFICIAL_TEXT_STATUS,
+        decision.FINAL_TEXT_STATUS,
+
+        decision.FEATURE_QUALITY_PASS_FLAG,
+        decision.MODEL_OOD_FLAG,
+        decision.MODEL_INFERENCE_SUCCESS_FLAG,
+        decision.ENGINEER_APPROVAL_FLAG,
+        decision.ESTIMATED_COST_IMPACT_PCT::FLOAT,
+
+        decision.ML_INPUT_STATUS,
+        decision.DECISION_STATUS,
+        decision.DECISION_SOURCE,
+        decision.FALLBACK_REASON,
+
+        decision.ML_VALUE_ACCEPTED_FLAG,
+        decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        :P_OVERRIDE_ID,
+        :P_OVERRIDE_NUMERIC_VALUE,
+        UPPER(TRIM(:P_OVERRIDE_TEXT_STATUS)),
+        ''PENDING_REVIEW'',
+
+        decision.CREATED_AT,
+        decision.UPDATED_AT,
+        CURRENT_TIMESTAMP()
+    FROM ML_DECISION_RESULT_V1 decision
+    WHERE decision.DECISION_ID =
+          :P_DECISION_ID;
+
+    RETURN OBJECT_CONSTRUCT_KEEP_NULL(
+        ''status'', ''SUCCESS'',
+        ''override_id'', P_OVERRIDE_ID,
+        ''decision_id'', P_DECISION_ID,
+        ''model_domain'', V_MODEL_DOMAIN,
+        ''override_status'', ''PENDING_REVIEW'',
+        ''override_numeric_value'',
+            P_OVERRIDE_NUMERIC_VALUE,
+        ''override_text_status'',
+            UPPER(TRIM(P_OVERRIDE_TEXT_STATUS)),
+        ''official_value_changed'', FALSE
+    );
+END;
+';
+
+
+-- ------------------------------------------------------------
+-- 5. SEPARATE REVIEW / APPROVAL PROCEDURE
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE REVIEW_ML_DECISION_OVERRIDE_V1(
+    P_OVERRIDE_ID VARCHAR,
+    P_REVIEW_ACTION VARCHAR,
+    P_REVIEWED_BY VARCHAR,
+    P_REVIEW_NOTE VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    V_OVERRIDE_COUNT NUMBER DEFAULT 0;
+
+    V_DECISION_ID VARCHAR;
+    V_REQUESTED_BY VARCHAR;
+    V_OVERRIDE_NUMERIC_VALUE FLOAT;
+    V_OVERRIDE_TEXT_STATUS VARCHAR;
+    V_OVERRIDE_REASON VARCHAR;
+
+    V_REVIEW_ACTION VARCHAR;
+    V_NEW_STATUS VARCHAR;
+    V_AUDIT_EVENT_TYPE VARCHAR;
+    V_AUDIT_EVENT_ID VARCHAR;
+BEGIN
+    IF (
+        P_OVERRIDE_ID IS NULL
+        OR LENGTH(TRIM(P_OVERRIDE_ID)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_OVERRIDE_ID is required.''
+        );
+    END IF;
+
+    IF (
+        P_REVIEW_ACTION IS NULL
+        OR UPPER(TRIM(P_REVIEW_ACTION))
+           NOT IN (''APPROVE'', ''REJECT'')
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''P_REVIEW_ACTION must be APPROVE or REJECT.''
+        );
+    END IF;
+
+    IF (
+        P_REVIEWED_BY IS NULL
+        OR LENGTH(TRIM(P_REVIEWED_BY)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_REVIEWED_BY is required.''
+        );
+    END IF;
+
+    IF (
+        P_REVIEW_NOTE IS NULL
+        OR LENGTH(TRIM(P_REVIEW_NOTE)) < 5
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''P_REVIEW_NOTE must contain at least 5 characters.''
+        );
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_OVERRIDE_COUNT
+    FROM ML_DECISION_OVERRIDE_V1
+    WHERE OVERRIDE_ID = :P_OVERRIDE_ID
+      AND OVERRIDE_STATUS =
+          ''PENDING_REVIEW'';
+
+    IF (V_OVERRIDE_COUNT <> 1) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''Exactly one pending override must exist.'',
+            ''override_count'', V_OVERRIDE_COUNT
+        );
+    END IF;
+
+    SELECT
+        DECISION_ID,
+        REQUESTED_BY,
+        OVERRIDE_NUMERIC_VALUE::FLOAT,
+        OVERRIDE_TEXT_STATUS,
+        OVERRIDE_REASON
+    INTO
+        :V_DECISION_ID,
+        :V_REQUESTED_BY,
+        :V_OVERRIDE_NUMERIC_VALUE,
+        :V_OVERRIDE_TEXT_STATUS,
+        :V_OVERRIDE_REASON
+    FROM ML_DECISION_OVERRIDE_V1
+    WHERE OVERRIDE_ID = :P_OVERRIDE_ID
+      AND OVERRIDE_STATUS =
+          ''PENDING_REVIEW'';
+
+    IF (
+        UPPER(TRIM(P_REVIEWED_BY))
+        = UPPER(TRIM(V_REQUESTED_BY))
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'',
+            ''Requester and reviewer must be different users.''
+        );
+    END IF;
+
+    V_REVIEW_ACTION :=
+        UPPER(TRIM(P_REVIEW_ACTION));
+
+    IF (V_REVIEW_ACTION = ''APPROVE'') THEN
+        V_NEW_STATUS :=
+            ''APPROVED_NOT_APPLIED'';
+        V_AUDIT_EVENT_TYPE :=
+            ''OVERRIDE_APPROVED'';
+    ELSE
+        V_NEW_STATUS :=
+            ''REJECTED'';
+        V_AUDIT_EVENT_TYPE :=
+            ''OVERRIDE_REJECTED'';
+    END IF;
+
+    UPDATE ML_DECISION_OVERRIDE_V1
+    SET
+        OVERRIDE_STATUS =
+            :V_NEW_STATUS,
+        REVIEWED_BY =
+            TRIM(:P_REVIEWED_BY),
+        REVIEWED_AT =
+            CURRENT_TIMESTAMP(),
+        REVIEW_ACTION =
+            :V_REVIEW_ACTION,
+        REVIEW_NOTE =
+            TRIM(:P_REVIEW_NOTE),
+        OVERRIDE_APPLIED_TO_OFFICIAL_FLAG =
+            FALSE,
+        UPDATED_AT =
+            CURRENT_TIMESTAMP()
+    WHERE OVERRIDE_ID =
+          :P_OVERRIDE_ID
+      AND OVERRIDE_STATUS =
+          ''PENDING_REVIEW'';
+
+    V_AUDIT_EVENT_ID := UUID_STRING();
+
+    INSERT INTO ML_DECISION_AUDIT_V1 (
+        AUDIT_EVENT_ID,
+        AUDIT_EVENT_TYPE,
+        AUDIT_EVENT_ACTOR,
+        AUDIT_EVENT_REASON,
+
+        DECISION_ID,
+        ENTITY_ID,
+        RFQ_ID,
+        SIMULATION_ID,
+        MODEL_DOMAIN,
+
+        POLICY_ID,
+        POLICY_VERSION,
+        DEPLOYMENT_MODE,
+        DECISION_TYPE,
+
+        MODEL_NAME,
+        MODEL_VERSION,
+        FEATURE_SET_VERSION,
+
+        RULE_VALUE,
+        RAW_ML_VALUE,
+        RECOMMENDED_ML_VALUE,
+        FINAL_NUMERIC_VALUE,
+
+        OFFICIAL_TEXT_STATUS,
+        FINAL_TEXT_STATUS,
+
+        FEATURE_QUALITY_PASS_FLAG,
+        MODEL_OOD_FLAG,
+        MODEL_INFERENCE_SUCCESS_FLAG,
+        ENGINEER_APPROVAL_FLAG,
+        ESTIMATED_COST_IMPACT_PCT,
+
+        ML_INPUT_STATUS,
+        DECISION_STATUS,
+        DECISION_SOURCE,
+        FALLBACK_REASON,
+
+        ML_VALUE_ACCEPTED_FLAG,
+        EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        OVERRIDE_ID,
+        OVERRIDE_NUMERIC_VALUE,
+        OVERRIDE_TEXT_STATUS,
+        OVERRIDE_STATUS,
+
+        SOURCE_DECISION_CREATED_AT,
+        SOURCE_DECISION_UPDATED_AT,
+        AUDITED_AT
+    )
+    SELECT
+        :V_AUDIT_EVENT_ID,
+        :V_AUDIT_EVENT_TYPE,
+        TRIM(:P_REVIEWED_BY),
+        TRIM(:P_REVIEW_NOTE),
+
+        decision.DECISION_ID,
+        decision.ENTITY_ID,
+        decision.RFQ_ID,
+        decision.SIMULATION_ID,
+        decision.MODEL_DOMAIN,
+
+        decision.POLICY_ID,
+        decision.POLICY_VERSION,
+        decision.DEPLOYMENT_MODE,
+        decision.DECISION_TYPE,
+
+        decision.MODEL_NAME,
+        decision.MODEL_VERSION,
+        decision.FEATURE_SET_VERSION,
+
+        decision.RULE_VALUE::FLOAT,
+        decision.RAW_ML_VALUE::FLOAT,
+        decision.RECOMMENDED_ML_VALUE::FLOAT,
+        decision.FINAL_NUMERIC_VALUE::FLOAT,
+
+        decision.OFFICIAL_TEXT_STATUS,
+        decision.FINAL_TEXT_STATUS,
+
+        decision.FEATURE_QUALITY_PASS_FLAG,
+        decision.MODEL_OOD_FLAG,
+        decision.MODEL_INFERENCE_SUCCESS_FLAG,
+        decision.ENGINEER_APPROVAL_FLAG,
+        decision.ESTIMATED_COST_IMPACT_PCT::FLOAT,
+
+        decision.ML_INPUT_STATUS,
+        decision.DECISION_STATUS,
+        decision.DECISION_SOURCE,
+        decision.FALLBACK_REASON,
+
+        decision.ML_VALUE_ACCEPTED_FLAG,
+        decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+        override_record.OVERRIDE_ID,
+        override_record.OVERRIDE_NUMERIC_VALUE::FLOAT,
+        override_record.OVERRIDE_TEXT_STATUS,
+        :V_NEW_STATUS,
+
+        decision.CREATED_AT,
+        decision.UPDATED_AT,
+        CURRENT_TIMESTAMP()
+    FROM ML_DECISION_RESULT_V1 decision
+    INNER JOIN ML_DECISION_OVERRIDE_V1 override_record
+        ON decision.DECISION_ID =
+           override_record.DECISION_ID
+    WHERE override_record.OVERRIDE_ID =
+          :P_OVERRIDE_ID;
+
+    RETURN OBJECT_CONSTRUCT_KEEP_NULL(
+        ''status'', ''SUCCESS'',
+        ''override_id'', P_OVERRIDE_ID,
+        ''decision_id'', V_DECISION_ID,
+        ''review_action'', V_REVIEW_ACTION,
+        ''override_status'', V_NEW_STATUS,
+        ''override_numeric_value'',
+            V_OVERRIDE_NUMERIC_VALUE,
+        ''override_text_status'',
+            V_OVERRIDE_TEXT_STATUS,
+        ''official_value_changed'', FALSE,
+        ''override_applied_to_official'', FALSE
+    );
+END;
+';
+
+
+-- ------------------------------------------------------------
+-- 6. DECISION + LATEST OVERRIDE VIEW
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VW_ML_DECISION_WITH_OVERRIDE_V1
+AS
+WITH LATEST_OVERRIDE AS (
+    SELECT *
+    FROM ML_DECISION_OVERRIDE_V1
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY DECISION_ID
+        ORDER BY
+            UPDATED_AT DESC,
+            CREATED_AT DESC
+    ) = 1
+)
+SELECT
+    decision.DECISION_ID,
+    decision.ENTITY_ID,
+    decision.RFQ_ID,
+    decision.SIMULATION_ID,
+    decision.MODEL_DOMAIN,
+
+    decision.POLICY_ID,
+    decision.POLICY_VERSION,
+    decision.DEPLOYMENT_MODE,
+
+    decision.MODEL_NAME,
+    decision.MODEL_VERSION,
+    decision.FEATURE_SET_VERSION,
+
+    decision.RULE_VALUE,
+    decision.RAW_ML_VALUE,
+    decision.RECOMMENDED_ML_VALUE,
+
+    decision.FINAL_NUMERIC_VALUE
+        AS OFFICIAL_FINAL_NUMERIC_VALUE,
+
+    decision.FINAL_TEXT_STATUS
+        AS OFFICIAL_FINAL_TEXT_STATUS,
+
+    override_record.OVERRIDE_ID,
+    override_record.OVERRIDE_NUMERIC_VALUE,
+    override_record.OVERRIDE_TEXT_STATUS,
+    override_record.OVERRIDE_STATUS,
+    override_record.OVERRIDE_REASON,
+    override_record.REQUESTED_BY,
+    override_record.REQUESTED_AT,
+    override_record.REVIEWED_BY,
+    override_record.REVIEWED_AT,
+    override_record.REVIEW_NOTE,
+
+    IFF(
+        override_record.OVERRIDE_STATUS =
+            'APPROVED_NOT_APPLIED',
+        override_record.OVERRIDE_NUMERIC_VALUE,
+        NULL::FLOAT
+    ) AS APPROVED_SHADOW_OVERRIDE_NUMERIC_VALUE,
+
+    IFF(
+        override_record.OVERRIDE_STATUS =
+            'APPROVED_NOT_APPLIED',
+        override_record.OVERRIDE_TEXT_STATUS,
+        NULL
+    ) AS APPROVED_SHADOW_OVERRIDE_TEXT_STATUS,
+
+    COALESCE(
+        IFF(
+            override_record.OVERRIDE_STATUS =
+                'APPROVED_NOT_APPLIED',
+            override_record.OVERRIDE_NUMERIC_VALUE,
+            NULL::FLOAT
+        )::FLOAT,
+        decision.FINAL_NUMERIC_VALUE::FLOAT
+    ) AS SHADOW_COMPARISON_NUMERIC_VALUE,
+
+    COALESCE(
+        IFF(
+            override_record.OVERRIDE_STATUS =
+                'APPROVED_NOT_APPLIED',
+            override_record.OVERRIDE_TEXT_STATUS,
+            NULL
+        )::VARCHAR,
+        decision.FINAL_TEXT_STATUS::VARCHAR
+    ) AS SHADOW_COMPARISON_TEXT_STATUS,
+
+    FALSE AS OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+
+    decision.ML_VALUE_ACCEPTED_FLAG,
+    decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+    decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+
+    decision.CREATED_AT AS DECISION_CREATED_AT,
+    decision.UPDATED_AT AS DECISION_UPDATED_AT
+
+FROM ML_DECISION_RESULT_V1 decision
+
+LEFT JOIN LATEST_OVERRIDE override_record
+    ON decision.DECISION_ID =
+       override_record.DECISION_ID;
+
+-- ============================================================
+-- PHASE 9C VERIFICATION
+--
+-- Requires the Phase 9B sample decisions.
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. CAPTURE BASE DECISION SNAPSHOTS
+-- ------------------------------------------------------------
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_CSS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial CSS governed decision snapshot.'
+);
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_FMIS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial FMIS governed decision snapshot.'
+);
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_TDS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial TDS governed decision snapshot.'
+);
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_BMCS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial BMCS governed decision snapshot.'
+);
+
+
+-- ------------------------------------------------------------
+-- 2. SUBMIT AND APPROVE A TDS SHADOW OVERRIDE
+-- ------------------------------------------------------------
+
+CALL SUBMIT_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_TDS_001',
+    'PHASE9B_TDS_001',
+    1.50,
+    NULL,
+    'ENGINEER_REQUESTOR',
+    'Engineering comparison value based on tooling review.'
+);
+
+CALL REVIEW_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_TDS_001',
+    'APPROVE',
+    'ENGINEER_REVIEWER',
+    'Approved for shadow comparison only.'
+);
+
+
+-- ------------------------------------------------------------
+-- 3. SUBMIT AND APPROVE A BMCS SHADOW OVERRIDE
+-- ------------------------------------------------------------
+
+CALL SUBMIT_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_BMCS_001',
+    'PHASE9B_BMCS_001',
+    NULL,
+    'REVIEW_RECOMMENDED',
+    'BMCS_REQUESTOR',
+    'Engineering review should remain recommended for this mapping.'
+);
+
+CALL REVIEW_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_BMCS_001',
+    'APPROVE',
+    'BMCS_REVIEWER',
+    'Approved as a shadow review comparison.'
+);
+
+
+-- ------------------------------------------------------------
+-- 4. OVERRIDE WORKFLOW RESULTS
+-- ------------------------------------------------------------
+
+SELECT
+    OVERRIDE_ID,
+    DECISION_ID,
+    MODEL_DOMAIN,
+
+    ORIGINAL_RULE_VALUE,
+    ORIGINAL_RECOMMENDED_ML_VALUE,
+    ORIGINAL_FINAL_NUMERIC_VALUE,
+    ORIGINAL_FINAL_TEXT_STATUS,
+
+    OVERRIDE_NUMERIC_VALUE,
+    OVERRIDE_TEXT_STATUS,
+    OVERRIDE_STATUS,
+
+    REQUESTED_BY,
+    REQUESTED_AT,
+    REVIEWED_BY,
+    REVIEWED_AT,
+    REVIEW_ACTION,
+
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG
+
+FROM ML_DECISION_OVERRIDE_V1
+
+WHERE OVERRIDE_ID LIKE
+      'PHASE9C_OVERRIDE_%'
+
+ORDER BY OVERRIDE_ID;
+
+
+-- ------------------------------------------------------------
+-- 5. OFFICIAL VALUE MUST REMAIN UNCHANGED
+-- ------------------------------------------------------------
+
+SELECT
+    DECISION_ID,
+    MODEL_DOMAIN,
+
+    RULE_VALUE,
+    RECOMMENDED_ML_VALUE,
+
+    OFFICIAL_FINAL_NUMERIC_VALUE,
+    OFFICIAL_FINAL_TEXT_STATUS,
+
+    APPROVED_SHADOW_OVERRIDE_NUMERIC_VALUE,
+    APPROVED_SHADOW_OVERRIDE_TEXT_STATUS,
+
+    SHADOW_COMPARISON_NUMERIC_VALUE,
+    SHADOW_COMPARISON_TEXT_STATUS,
+
+    OVERRIDE_STATUS,
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+
+FROM VW_ML_DECISION_WITH_OVERRIDE_V1
+
+WHERE DECISION_ID IN (
+    'PHASE9B_TDS_001',
+    'PHASE9B_BMCS_001'
+)
+
+ORDER BY DECISION_ID;
+
+
+-- ------------------------------------------------------------
+-- 6. APPEND-ONLY AUDIT EVENTS
+-- ------------------------------------------------------------
+
+SELECT
+    AUDIT_EVENT_ID,
+    AUDIT_EVENT_TYPE,
+    AUDIT_EVENT_ACTOR,
+    AUDIT_EVENT_REASON,
+
+    DECISION_ID,
+    MODEL_DOMAIN,
+
+    RULE_VALUE,
+    RECOMMENDED_ML_VALUE,
+    FINAL_NUMERIC_VALUE,
+    FINAL_TEXT_STATUS,
+
+    OVERRIDE_ID,
+    OVERRIDE_NUMERIC_VALUE,
+    OVERRIDE_TEXT_STATUS,
+    OVERRIDE_STATUS,
+
+    AUDITED_AT
+
+FROM ML_DECISION_AUDIT_V1
+
+WHERE DECISION_ID LIKE 'PHASE9B_%'
+
+ORDER BY AUDITED_AT, AUDIT_EVENT_ID;
+
+
+-- ------------------------------------------------------------
+-- 7. INTEGRITY GATES
+--
+-- Expected all values = 0.
+-- ------------------------------------------------------------
+
+SELECT
+    COUNT_IF(
+        OVERRIDE_STATUS =
+            'APPROVED_NOT_APPLIED'
+        AND REVIEWED_BY IS NULL
+    ) AS APPROVED_WITHOUT_REVIEWER_ROWS,
+
+    COUNT_IF(
+        UPPER(TRIM(REQUESTED_BY))
+        = UPPER(TRIM(REVIEWED_BY))
+    ) AS SAME_REQUESTER_REVIEWER_ROWS,
+
+    COUNT_IF(
+        OVERRIDE_REASON IS NULL
+        OR LENGTH(TRIM(OVERRIDE_REASON)) < 10
+    ) AS INVALID_REASON_ROWS,
+
+    COUNT_IF(
+        OVERRIDE_APPLIED_TO_OFFICIAL_FLAG = TRUE
+    ) AS INVALID_OFFICIAL_APPLICATION_ROWS
+
+FROM ML_DECISION_OVERRIDE_V1
+
+WHERE OVERRIDE_ID LIKE
+      'PHASE9C_OVERRIDE_%';
+
+
+SELECT
+    COUNT_IF(
+        decision.FINAL_NUMERIC_VALUE
+        <> override_record.ORIGINAL_FINAL_NUMERIC_VALUE
+    ) AS CHANGED_OFFICIAL_NUMERIC_ROWS,
+
+    COUNT_IF(
+        COALESCE(
+            decision.FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'
+        )
+        <>
+        COALESCE(
+            override_record.ORIGINAL_FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'
+        )
+    ) AS CHANGED_OFFICIAL_TEXT_ROWS,
+
+    COUNT_IF(
+        decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG
+            = TRUE
+        OR
+        decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+            = TRUE
+    ) AS INVALID_AUTHORITY_ROWS
+
+FROM ML_DECISION_OVERRIDE_V1 override_record
+
+INNER JOIN ML_DECISION_RESULT_V1 decision
+    ON override_record.DECISION_ID =
+       decision.DECISION_ID
+
+WHERE override_record.OVERRIDE_ID LIKE
+      'PHASE9C_OVERRIDE_%';
+
+
+USE DATABASE KMAT_COST_MODEL_DB;
+USE SCHEMA CORE_ML;
+
+-- ============================================================
+-- PHASE 9C PREREQUISITE RECOVERY
+--
+-- Cause of the earlier errors:
+-- ML_DECISION_RESULT_V1 did not contain the Phase 9B sample
+-- decisions required by the Phase 9C verification script.
+--
+-- This script:
+--   1. Verifies the four Phase 9A policies.
+--   2. Creates/upserts the Phase 9B sample decisions.
+--   3. Confirms all required decisions exist exactly once.
+--   4. Runs the Phase 9C audit and override tests.
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. VERIFY CURRENT POLICIES
+-- Expected: four rows, all SHADOW and ACTIVE.
+-- ------------------------------------------------------------
+
+SELECT
+    MODEL_DOMAIN,
+    POLICY_ID,
+    POLICY_VERSION,
+    POLICY_STATUS,
+    DEPLOYMENT_MODE,
+    AUTO_USE_ALLOWED_FLAG,
+    OFFICIAL_COST_IMPACT_ALLOWED_FLAG,
+    BUSINESS_DECISION_ALLOWED_FLAG
+FROM VW_ML_DECISION_POLICY_CURRENT_V1
+ORDER BY MODEL_DOMAIN;
+
+
+-- ------------------------------------------------------------
+-- 2. CREATE / UPSERT PHASE 9B SAMPLE DECISIONS
+--
+-- RESOLVE_KMAT_ML_DECISION_V1 is idempotent by DECISION_ID.
+-- ------------------------------------------------------------
+
+CALL RESOLVE_KMAT_ML_DECISION_V1(
+    'PHASE9B_CSS_001',
+    'SIM_001',
+    'RFQ_001',
+    'SIM_001',
+    'CSS',
+
+    0.06,
+    0.85,
+    0.08,
+    NULL,
+
+    TRUE,
+    FALSE,
+    TRUE,
+    FALSE,
+    1.25,
+
+    'CSS_CLASSIFIER',
+    'V2_SHADOW_1',
+    'CSS_FEATURES_V2'
+);
+
+
+CALL RESOLVE_KMAT_ML_DECISION_V1(
+    'PHASE9B_FMIS_001',
+    'SIM_001',
+    'RFQ_001',
+    'SIM_001',
+    'FMIS',
+
+    1.05,
+    126.40,
+    1.08,
+    NULL,
+
+    TRUE,
+    FALSE,
+    TRUE,
+    FALSE,
+    2.10,
+
+    'FMIS_FORECAST_MODEL',
+    'V2_SHADOW_1',
+    'FMIS_FEATURES_V2'
+);
+
+
+CALL RESOLVE_KMAT_ML_DECISION_V1(
+    'PHASE9B_TDS_001',
+    'SIM_001',
+    'RFQ_001',
+    'SIM_001',
+    'TDS',
+
+    1.40,
+    1.58,
+    1.58,
+    NULL,
+
+    TRUE,
+    FALSE,
+    TRUE,
+    FALSE,
+    0.85,
+
+    'TDS_XGB_REGRESSOR',
+    'V2_SHADOW_1',
+    'TDS_FEATURES_V2'
+);
+
+
+CALL RESOLVE_KMAT_ML_DECISION_V1(
+    'PHASE9B_BMCS_001',
+    'RFQ_001::SIM_RFQ_001::V1',
+    'RFQ_001',
+    'SIM_RFQ_001',
+    'BMCS',
+
+    95.70,
+    0.9415,
+    94.15,
+    'AUTO_APPROVED',
+
+    TRUE,
+    FALSE,
+    TRUE,
+    FALSE,
+    NULL,
+
+    'BMCS_CALIBRATED_CLASSIFIER',
+    'V2_SHADOW_2',
+    'BMCS_PHASE7_ADAPTER_V2'
+);
+
+
+CALL RESOLVE_KMAT_ML_DECISION_V1(
+    'PHASE9B_TDS_QUALITY_FAIL_001',
+    'SIM_QUALITY_FAIL_001',
+    'RFQ_QUALITY_FAIL_001',
+    'SIM_QUALITY_FAIL_001',
+    'TDS',
+
+    1.40,
+    1.72,
+    1.72,
+    NULL,
+
+    FALSE,
+    FALSE,
+    TRUE,
+    FALSE,
+    1.00,
+
+    'TDS_XGB_REGRESSOR',
+    'V2_SHADOW_1',
+    'TDS_FEATURES_V2'
+);
+
+
+-- ------------------------------------------------------------
+-- 3. REQUIRED PRECONDITION CHECK
+--
+-- Expected:
+-- REQUIRED_DECISION_ROWS = 5
+-- DISTINCT_DECISION_ROWS = 5
+-- ------------------------------------------------------------
+
+SELECT
+    COUNT(*) AS REQUIRED_DECISION_ROWS,
+    COUNT(DISTINCT DECISION_ID)
+        AS DISTINCT_DECISION_ROWS,
+
+    COUNT_IF(
+        DEPLOYMENT_MODE <> 'SHADOW'
+    ) AS INVALID_DEPLOYMENT_ROWS,
+
+    COUNT_IF(
+        ML_VALUE_ACCEPTED_FLAG = TRUE
+        OR EFFECTIVE_COST_IMPACT_ALLOWED_FLAG = TRUE
+        OR EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG = TRUE
+    ) AS INVALID_AUTHORITY_ROWS
+
+FROM ML_DECISION_RESULT_V1
+
+WHERE DECISION_ID IN (
+    'PHASE9B_CSS_001',
+    'PHASE9B_FMIS_001',
+    'PHASE9B_TDS_001',
+    'PHASE9B_BMCS_001',
+    'PHASE9B_TDS_QUALITY_FAIL_001'
+);
+
+
+SELECT
+    DECISION_ID,
+    MODEL_DOMAIN,
+    RULE_VALUE,
+    RAW_ML_VALUE,
+    RECOMMENDED_ML_VALUE,
+    FINAL_NUMERIC_VALUE,
+    OFFICIAL_TEXT_STATUS,
+    FINAL_TEXT_STATUS,
+    ML_INPUT_STATUS,
+    DECISION_STATUS,
+    FALLBACK_REASON,
+    ML_VALUE_ACCEPTED_FLAG,
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+FROM ML_DECISION_RESULT_V1
+WHERE DECISION_ID LIKE 'PHASE9B_%'
+ORDER BY DECISION_ID;
+
+
+-- ------------------------------------------------------------
+-- 4. CAPTURE PHASE 9C AUDIT SNAPSHOTS
+--
+-- Audit events are intentionally append-only. Running this
+-- block again creates additional valid snapshot events.
+-- ------------------------------------------------------------
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_CSS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial CSS governed decision snapshot.'
+);
+
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_FMIS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial FMIS governed decision snapshot.'
+);
+
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_TDS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial TDS governed decision snapshot.'
+);
+
+
+CALL CAPTURE_ML_DECISION_AUDIT_V1(
+    'PHASE9B_BMCS_001',
+    'DECISION_SNAPSHOT',
+    'PHASE9C_TEST',
+    'Initial BMCS governed decision snapshot.'
+);
+
+
+-- ------------------------------------------------------------
+-- 5. SUBMIT AND REVIEW THE TDS SHADOW OVERRIDE
+--
+-- These test IDs were not inserted during the failed run,
+-- because decision validation stopped before INSERT.
+-- ------------------------------------------------------------
+
+CALL SUBMIT_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_TDS_001',
+    'PHASE9B_TDS_001',
+    1.50,
+    NULL,
+    'ENGINEER_REQUESTOR',
+    'Engineering comparison value based on tooling review.'
+);
+
+
+CALL REVIEW_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_TDS_001',
+    'APPROVE',
+    'ENGINEER_REVIEWER',
+    'Approved for shadow comparison only.'
+);
+
+
+-- ------------------------------------------------------------
+-- 6. SUBMIT AND REVIEW THE BMCS SHADOW OVERRIDE
+-- ------------------------------------------------------------
+
+CALL SUBMIT_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_BMCS_001',
+    'PHASE9B_BMCS_001',
+    NULL,
+    'REVIEW_RECOMMENDED',
+    'BMCS_REQUESTOR',
+    'Engineering review should remain recommended for this mapping.'
+);
+
+
+CALL REVIEW_ML_DECISION_OVERRIDE_V1(
+    'PHASE9C_OVERRIDE_BMCS_001',
+    'APPROVE',
+    'BMCS_REVIEWER',
+    'Approved as a shadow review comparison.'
+);
+
+
+-- ------------------------------------------------------------
+-- 7. VERIFY OVERRIDES
+--
+-- Expected:
+-- Both rows = APPROVED_NOT_APPLIED
+-- OVERRIDE_APPLIED_TO_OFFICIAL_FLAG = FALSE
+-- ------------------------------------------------------------
+
+SELECT
+    OVERRIDE_ID,
+    DECISION_ID,
+    MODEL_DOMAIN,
+
+    ORIGINAL_RULE_VALUE,
+    ORIGINAL_RECOMMENDED_ML_VALUE,
+    ORIGINAL_FINAL_NUMERIC_VALUE,
+    ORIGINAL_FINAL_TEXT_STATUS,
+
+    OVERRIDE_NUMERIC_VALUE,
+    OVERRIDE_TEXT_STATUS,
+    OVERRIDE_STATUS,
+
+    REQUESTED_BY,
+    REVIEWED_BY,
+    REVIEW_ACTION,
+
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG
+
+FROM ML_DECISION_OVERRIDE_V1
+
+WHERE OVERRIDE_ID IN (
+    'PHASE9C_OVERRIDE_TDS_001',
+    'PHASE9C_OVERRIDE_BMCS_001'
+)
+
+ORDER BY OVERRIDE_ID;
+
+
+-- ------------------------------------------------------------
+-- 8. VERIFY OFFICIAL VALUES REMAIN UNCHANGED
+-- ------------------------------------------------------------
+
+SELECT
+    DECISION_ID,
+    MODEL_DOMAIN,
+
+    RULE_VALUE,
+    RECOMMENDED_ML_VALUE,
+
+    OFFICIAL_FINAL_NUMERIC_VALUE,
+    OFFICIAL_FINAL_TEXT_STATUS,
+
+    APPROVED_SHADOW_OVERRIDE_NUMERIC_VALUE,
+    APPROVED_SHADOW_OVERRIDE_TEXT_STATUS,
+
+    SHADOW_COMPARISON_NUMERIC_VALUE,
+    SHADOW_COMPARISON_TEXT_STATUS,
+
+    OVERRIDE_STATUS,
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+
+FROM VW_ML_DECISION_WITH_OVERRIDE_V1
+
+WHERE DECISION_ID IN (
+    'PHASE9B_TDS_001',
+    'PHASE9B_BMCS_001'
+)
+
+ORDER BY DECISION_ID;
+
+
+-- ------------------------------------------------------------
+-- 9. FINAL INTEGRITY GATES
+--
+-- Expected all values = 0.
+-- ------------------------------------------------------------
+
+SELECT
+    COUNT_IF(
+        OVERRIDE_STATUS =
+            'APPROVED_NOT_APPLIED'
+        AND REVIEWED_BY IS NULL
+    ) AS APPROVED_WITHOUT_REVIEWER_ROWS,
+
+    COUNT_IF(
+        UPPER(TRIM(REQUESTED_BY))
+        = UPPER(TRIM(REVIEWED_BY))
+    ) AS SAME_REQUESTER_REVIEWER_ROWS,
+
+    COUNT_IF(
+        OVERRIDE_REASON IS NULL
+        OR LENGTH(TRIM(OVERRIDE_REASON)) < 10
+    ) AS INVALID_REASON_ROWS,
+
+    COUNT_IF(
+        OVERRIDE_APPLIED_TO_OFFICIAL_FLAG = TRUE
+    ) AS INVALID_OFFICIAL_APPLICATION_ROWS
+
+FROM ML_DECISION_OVERRIDE_V1
+
+WHERE OVERRIDE_ID IN (
+    'PHASE9C_OVERRIDE_TDS_001',
+    'PHASE9C_OVERRIDE_BMCS_001'
+);
+
+
+SELECT
+    COUNT_IF(
+        decision.FINAL_NUMERIC_VALUE
+        <>
+        override_record.ORIGINAL_FINAL_NUMERIC_VALUE
+    ) AS CHANGED_OFFICIAL_NUMERIC_ROWS,
+
+    COUNT_IF(
+        COALESCE(
+            decision.FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'
+        )
+        <>
+        COALESCE(
+            override_record
+                .ORIGINAL_FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'
+        )
+    ) AS CHANGED_OFFICIAL_TEXT_ROWS,
+
+    COUNT_IF(
+        decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG
+            = TRUE
+        OR
+        decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG
+            = TRUE
+    ) AS INVALID_AUTHORITY_ROWS
+
+FROM ML_DECISION_OVERRIDE_V1 override_record
+
+INNER JOIN ML_DECISION_RESULT_V1 decision
+    ON override_record.DECISION_ID =
+       decision.DECISION_ID
+
+WHERE override_record.OVERRIDE_ID IN (
+    'PHASE9C_OVERRIDE_TDS_001',
+    'PHASE9C_OVERRIDE_BMCS_001'
+);
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE KMAT_WH;
+USE DATABASE KMAT_COST_MODEL_DB;
+USE SCHEMA CORE_ML;
+
+-- ============================================================
+-- PHASE 9D — SHADOW VALIDATION
+-- Validates Phase 9A, 9B and 9C without changing official cost.
+-- ============================================================
+
+CREATE OR REPLACE VIEW VW_ML_SHADOW_VALIDATION_DETAIL_V1 AS
+WITH LATEST_OVERRIDE AS (
+    SELECT *
+    FROM ML_DECISION_OVERRIDE_V1
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY DECISION_ID
+        ORDER BY UPDATED_AT DESC, CREATED_AT DESC, OVERRIDE_ID DESC
+    ) = 1
+),
+BASE AS (
+    SELECT
+        decision.DECISION_ID,
+        decision.ENTITY_ID,
+        decision.RFQ_ID,
+        decision.SIMULATION_ID,
+        decision.MODEL_DOMAIN,
+        decision.POLICY_ID,
+        decision.POLICY_VERSION,
+        decision.DEPLOYMENT_MODE,
+        decision.DECISION_TYPE,
+        decision.MODEL_NAME,
+        decision.MODEL_VERSION,
+        decision.FEATURE_SET_VERSION,
+        decision.RULE_VALUE::FLOAT AS RULE_VALUE,
+        decision.RAW_ML_VALUE::FLOAT AS RAW_ML_VALUE,
+        decision.RECOMMENDED_ML_VALUE::FLOAT AS RECOMMENDED_ML_VALUE,
+        decision.FINAL_NUMERIC_VALUE::FLOAT AS OFFICIAL_FINAL_NUMERIC_VALUE,
+        decision.OFFICIAL_TEXT_STATUS,
+        decision.FINAL_TEXT_STATUS AS OFFICIAL_FINAL_TEXT_STATUS,
+        decision.FEATURE_QUALITY_PASS_FLAG,
+        decision.MODEL_OOD_FLAG,
+        decision.MODEL_INFERENCE_SUCCESS_FLAG,
+        decision.ENGINEER_APPROVAL_FLAG,
+        decision.ESTIMATED_COST_IMPACT_PCT::FLOAT AS ESTIMATED_COST_IMPACT_PCT,
+        decision.ML_INPUT_STATUS,
+        decision.DECISION_STATUS,
+        decision.DECISION_SOURCE,
+        decision.FALLBACK_REASON,
+        decision.ML_VALUE_ACCEPTED_FLAG,
+        decision.EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+        decision.EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+        override_record.OVERRIDE_ID,
+        override_record.OVERRIDE_NUMERIC_VALUE::FLOAT AS OVERRIDE_NUMERIC_VALUE,
+        override_record.OVERRIDE_TEXT_STATUS,
+        override_record.OVERRIDE_STATUS,
+        override_record.OVERRIDE_REASON,
+        override_record.REQUESTED_BY,
+        override_record.REVIEWED_BY,
+        override_record.REVIEW_ACTION,
+        COALESCE(
+            override_record.OVERRIDE_APPLIED_TO_OFFICIAL_FLAG::BOOLEAN,
+            FALSE
+        ) AS OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+        IFF(
+            override_record.OVERRIDE_STATUS = 'APPROVED_NOT_APPLIED',
+            TRUE,
+            FALSE
+        ) AS APPROVED_SHADOW_OVERRIDE_FLAG,
+        IFF(
+            override_record.OVERRIDE_STATUS = 'PENDING_REVIEW',
+            TRUE,
+            FALSE
+        ) AS PENDING_OVERRIDE_FLAG,
+        IFF(
+            override_record.OVERRIDE_STATUS = 'APPROVED_NOT_APPLIED',
+            override_record.OVERRIDE_NUMERIC_VALUE::FLOAT,
+            NULL::FLOAT
+        ) AS APPROVED_SHADOW_OVERRIDE_NUMERIC_VALUE,
+        IFF(
+            override_record.OVERRIDE_STATUS = 'APPROVED_NOT_APPLIED',
+            override_record.OVERRIDE_TEXT_STATUS::VARCHAR,
+            NULL::VARCHAR
+        ) AS APPROVED_SHADOW_OVERRIDE_TEXT_STATUS,
+        COALESCE(
+            IFF(
+                override_record.OVERRIDE_STATUS = 'APPROVED_NOT_APPLIED',
+                override_record.OVERRIDE_NUMERIC_VALUE::FLOAT,
+                NULL::FLOAT
+            )::FLOAT,
+            decision.FINAL_NUMERIC_VALUE::FLOAT
+        ) AS SHADOW_COMPARISON_NUMERIC_VALUE,
+        COALESCE(
+            IFF(
+                override_record.OVERRIDE_STATUS = 'APPROVED_NOT_APPLIED',
+                override_record.OVERRIDE_TEXT_STATUS::VARCHAR,
+                NULL::VARCHAR
+            )::VARCHAR,
+            decision.FINAL_TEXT_STATUS::VARCHAR
+        ) AS SHADOW_COMPARISON_TEXT_STATUS,
+        decision.CREATED_AT AS DECISION_CREATED_AT,
+        decision.UPDATED_AT AS DECISION_UPDATED_AT
+    FROM ML_DECISION_RESULT_V1 decision
+    LEFT JOIN LATEST_OVERRIDE override_record
+        ON decision.DECISION_ID = override_record.DECISION_ID
+)
+SELECT
+    BASE.*,
+    IFF(
+        RULE_VALUE IS NOT NULL AND RECOMMENDED_ML_VALUE IS NOT NULL,
+        ABS(RECOMMENDED_ML_VALUE::FLOAT - RULE_VALUE::FLOAT),
+        NULL::FLOAT
+    ) AS ML_RULE_ABS_DELTA,
+    IFF(
+        RULE_VALUE IS NOT NULL
+        AND RULE_VALUE::FLOAT <> 0.0::FLOAT
+        AND RECOMMENDED_ML_VALUE IS NOT NULL,
+        ABS(RECOMMENDED_ML_VALUE::FLOAT - RULE_VALUE::FLOAT)
+            / ABS(RULE_VALUE::FLOAT) * 100.0::FLOAT,
+        NULL::FLOAT
+    ) AS ML_RULE_PCT_DELTA,
+    IFF(
+        RULE_VALUE IS NOT NULL
+        AND SHADOW_COMPARISON_NUMERIC_VALUE IS NOT NULL,
+        ABS(SHADOW_COMPARISON_NUMERIC_VALUE::FLOAT - RULE_VALUE::FLOAT),
+        NULL::FLOAT
+    ) AS SHADOW_RULE_ABS_DELTA,
+    IFF(
+        RULE_VALUE IS NOT NULL
+        AND RULE_VALUE::FLOAT <> 0.0::FLOAT
+        AND SHADOW_COMPARISON_NUMERIC_VALUE IS NOT NULL,
+        ABS(SHADOW_COMPARISON_NUMERIC_VALUE::FLOAT - RULE_VALUE::FLOAT)
+            / ABS(RULE_VALUE::FLOAT) * 100.0::FLOAT,
+        NULL::FLOAT
+    ) AS SHADOW_RULE_PCT_DELTA,
+    IFF(ML_INPUT_STATUS = 'VALID', TRUE, FALSE) AS VALID_ML_INPUT_FLAG,
+    IFF(ML_INPUT_STATUS <> 'VALID', TRUE, FALSE) AS FALLBACK_TRIGGER_FLAG,
+    IFF(
+        DEPLOYMENT_MODE = 'SHADOW'
+        AND NOT (
+            (OFFICIAL_FINAL_NUMERIC_VALUE IS NULL AND RULE_VALUE IS NULL)
+            OR (
+                OFFICIAL_FINAL_NUMERIC_VALUE IS NOT NULL
+                AND RULE_VALUE IS NOT NULL
+                AND OFFICIAL_FINAL_NUMERIC_VALUE::FLOAT = RULE_VALUE::FLOAT
+            )
+        ),
+        TRUE,
+        FALSE
+    ) AS OFFICIAL_NUMERIC_CHANGED_FLAG,
+    IFF(
+        DEPLOYMENT_MODE = 'SHADOW'
+        AND COALESCE(
+            OFFICIAL_FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'::VARCHAR
+        ) <> COALESCE(
+            OFFICIAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'::VARCHAR
+        ),
+        TRUE,
+        FALSE
+    ) AS OFFICIAL_TEXT_CHANGED_FLAG,
+    IFF(
+        DEPLOYMENT_MODE = 'SHADOW'
+        AND COALESCE(ML_VALUE_ACCEPTED_FLAG::BOOLEAN, FALSE) = FALSE
+        AND COALESCE(EFFECTIVE_COST_IMPACT_ALLOWED_FLAG::BOOLEAN, FALSE) = FALSE
+        AND COALESCE(EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG::BOOLEAN, FALSE) = FALSE
+        AND COALESCE(OVERRIDE_APPLIED_TO_OFFICIAL_FLAG::BOOLEAN, FALSE) = FALSE
+        AND (
+            (OFFICIAL_FINAL_NUMERIC_VALUE IS NULL AND RULE_VALUE IS NULL)
+            OR (
+                OFFICIAL_FINAL_NUMERIC_VALUE IS NOT NULL
+                AND RULE_VALUE IS NOT NULL
+                AND OFFICIAL_FINAL_NUMERIC_VALUE::FLOAT = RULE_VALUE::FLOAT
+            )
+        )
+        AND COALESCE(
+            OFFICIAL_FINAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'::VARCHAR
+        ) = COALESCE(
+            OFFICIAL_TEXT_STATUS::VARCHAR,
+            '__NULL__'::VARCHAR
+        ),
+        TRUE,
+        FALSE
+    ) AS SHADOW_SAFETY_PASS_FLAG
+FROM BASE;
+
+
+CREATE OR REPLACE VIEW VW_ML_SHADOW_VALIDATION_SUMMARY_V1 AS
+SELECT
+    CASE WHEN GROUPING(MODEL_DOMAIN) = 1 THEN 'ALL' ELSE MODEL_DOMAIN END AS MODEL_DOMAIN,
+    COUNT(*)::NUMBER AS TOTAL_DECISIONS,
+    COALESCE(COUNT_IF(VALID_ML_INPUT_FLAG = TRUE), 0)::NUMBER
+        AS VALID_ML_INPUT_ROWS,
+    COALESCE(COUNT_IF(ML_INPUT_STATUS = 'QUALITY_FAIL'), 0)::NUMBER
+        AS QUALITY_FAIL_ROWS,
+    COALESCE(COUNT_IF(ML_INPUT_STATUS = 'OOD_REJECT'), 0)::NUMBER
+        AS OOD_REJECT_ROWS,
+    COALESCE(COUNT_IF(ML_INPUT_STATUS = 'INFERENCE_FAIL'), 0)::NUMBER
+        AS INFERENCE_FAIL_ROWS,
+    COALESCE(COUNT_IF(FALLBACK_TRIGGER_FLAG = TRUE), 0)::NUMBER
+        AS FALLBACK_TRIGGER_ROWS,
+    COALESCE(COUNT_IF(APPROVED_SHADOW_OVERRIDE_FLAG = TRUE), 0)::NUMBER
+        AS APPROVED_SHADOW_OVERRIDE_ROWS,
+    COALESCE(COUNT_IF(PENDING_OVERRIDE_FLAG = TRUE), 0)::NUMBER
+        AS PENDING_OVERRIDE_ROWS,
+    ROUND(
+        COALESCE(COUNT_IF(VALID_ML_INPUT_FLAG = TRUE), 0)::FLOAT
+            / NULLIF(COUNT(*)::FLOAT, 0.0::FLOAT) * 100.0::FLOAT,
+        2
+    ) AS VALID_ML_COVERAGE_PCT,
+    ROUND(
+        COALESCE(COUNT_IF(FALLBACK_TRIGGER_FLAG = TRUE), 0)::FLOAT
+            / NULLIF(COUNT(*)::FLOAT, 0.0::FLOAT) * 100.0::FLOAT,
+        2
+    ) AS FALLBACK_TRIGGER_PCT,
+    ROUND(AVG(ML_RULE_ABS_DELTA::FLOAT), 6) AS AVG_ML_RULE_ABS_DELTA,
+    ROUND(MAX(ML_RULE_ABS_DELTA::FLOAT), 6) AS MAX_ML_RULE_ABS_DELTA,
+    ROUND(AVG(ML_RULE_PCT_DELTA::FLOAT), 6) AS AVG_ML_RULE_PCT_DELTA,
+    ROUND(MAX(ML_RULE_PCT_DELTA::FLOAT), 6) AS MAX_ML_RULE_PCT_DELTA,
+    ROUND(AVG(ESTIMATED_COST_IMPACT_PCT::FLOAT), 6)
+        AS AVG_ESTIMATED_COST_IMPACT_PCT,
+    ROUND(MAX(ABS(ESTIMATED_COST_IMPACT_PCT::FLOAT)), 6)
+        AS MAX_ABS_ESTIMATED_COST_IMPACT_PCT,
+    COALESCE(COUNT_IF(ML_VALUE_ACCEPTED_FLAG = TRUE), 0)::NUMBER
+        AS INVALID_ML_ACCEPTED_ROWS,
+    COALESCE(
+        COUNT_IF(
+            EFFECTIVE_COST_IMPACT_ALLOWED_FLAG = TRUE
+            OR EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG = TRUE
+        ),
+        0
+    )::NUMBER AS INVALID_AUTHORITY_ROWS,
+    COALESCE(COUNT_IF(OVERRIDE_APPLIED_TO_OFFICIAL_FLAG = TRUE), 0)::NUMBER
+        AS INVALID_OVERRIDE_APPLICATION_ROWS,
+    COALESCE(COUNT_IF(OFFICIAL_NUMERIC_CHANGED_FLAG = TRUE), 0)::NUMBER
+        AS CHANGED_OFFICIAL_NUMERIC_ROWS,
+    COALESCE(COUNT_IF(OFFICIAL_TEXT_CHANGED_FLAG = TRUE), 0)::NUMBER
+        AS CHANGED_OFFICIAL_TEXT_ROWS,
+    COALESCE(COUNT_IF(SHADOW_SAFETY_PASS_FLAG = FALSE), 0)::NUMBER
+        AS SHADOW_SAFETY_FAILURE_ROWS
+FROM VW_ML_SHADOW_VALIDATION_DETAIL_V1
+GROUP BY GROUPING SETS ((MODEL_DOMAIN), ());
+
+
+CREATE TABLE IF NOT EXISTS ML_SHADOW_VALIDATION_RUN_V1 (
+    VALIDATION_RUN_ID VARCHAR NOT NULL,
+    VALIDATION_SCOPE VARCHAR NOT NULL,
+    VALIDATED_BY VARCHAR NOT NULL,
+    VALIDATION_STATUS VARCHAR NOT NULL,
+    DEPLOYMENT_MODE VARCHAR NOT NULL,
+    ACTIVE_POLICY_COUNT NUMBER,
+    INVALID_POLICY_ROWS NUMBER,
+    TOTAL_DECISIONS NUMBER,
+    VALID_ML_INPUT_ROWS NUMBER,
+    QUALITY_FAIL_ROWS NUMBER,
+    OOD_REJECT_ROWS NUMBER,
+    INFERENCE_FAIL_ROWS NUMBER,
+    FALLBACK_TRIGGER_ROWS NUMBER,
+    APPROVED_SHADOW_OVERRIDE_ROWS NUMBER,
+    PENDING_OVERRIDE_ROWS NUMBER,
+    VALID_ML_COVERAGE_PCT FLOAT,
+    FALLBACK_TRIGGER_PCT FLOAT,
+    AVG_ML_RULE_ABS_DELTA FLOAT,
+    MAX_ML_RULE_ABS_DELTA FLOAT,
+    AVG_ML_RULE_PCT_DELTA FLOAT,
+    MAX_ML_RULE_PCT_DELTA FLOAT,
+    AVG_ESTIMATED_COST_IMPACT_PCT FLOAT,
+    MAX_ABS_ESTIMATED_COST_IMPACT_PCT FLOAT,
+    INVALID_ML_ACCEPTED_ROWS NUMBER,
+    INVALID_AUTHORITY_ROWS NUMBER,
+    INVALID_OVERRIDE_APPLICATION_ROWS NUMBER,
+    CHANGED_OFFICIAL_NUMERIC_ROWS NUMBER,
+    CHANGED_OFFICIAL_TEXT_ROWS NUMBER,
+    SHADOW_SAFETY_FAILURE_ROWS NUMBER,
+    ML_ADVISORY_ONLY_FLAG BOOLEAN,
+    OFFICIAL_COST_CHANGED_FLAG BOOLEAN,
+    BUSINESS_DECISION_ALLOWED_FLAG BOOLEAN,
+    VALIDATION_DETAIL VARIANT,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+CREATE OR REPLACE PROCEDURE RUN_ML_SHADOW_VALIDATION_V1(
+    P_VALIDATION_RUN_ID VARCHAR,
+    P_DECISION_ID_PREFIX VARCHAR,
+    P_VALIDATED_BY VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+DECLARE
+    V_EXISTING_RUN_COUNT NUMBER DEFAULT 0;
+    V_EXISTING_RESULT VARIANT;
+    V_VALIDATION_SCOPE VARCHAR;
+    V_VALIDATION_STATUS VARCHAR DEFAULT ''UNKNOWN'';
+    V_DEPLOYMENT_MODE VARCHAR DEFAULT ''SHADOW'';
+    V_ACTIVE_POLICY_COUNT NUMBER DEFAULT 0;
+    V_INVALID_POLICY_ROWS NUMBER DEFAULT 0;
+    V_TOTAL_DECISIONS NUMBER DEFAULT 0;
+    V_VALID_ML_INPUT_ROWS NUMBER DEFAULT 0;
+    V_QUALITY_FAIL_ROWS NUMBER DEFAULT 0;
+    V_OOD_REJECT_ROWS NUMBER DEFAULT 0;
+    V_INFERENCE_FAIL_ROWS NUMBER DEFAULT 0;
+    V_FALLBACK_TRIGGER_ROWS NUMBER DEFAULT 0;
+    V_APPROVED_OVERRIDE_ROWS NUMBER DEFAULT 0;
+    V_PENDING_OVERRIDE_ROWS NUMBER DEFAULT 0;
+    V_VALID_ML_COVERAGE_PCT FLOAT;
+    V_FALLBACK_TRIGGER_PCT FLOAT;
+    V_AVG_ML_RULE_ABS_DELTA FLOAT;
+    V_MAX_ML_RULE_ABS_DELTA FLOAT;
+    V_AVG_ML_RULE_PCT_DELTA FLOAT;
+    V_MAX_ML_RULE_PCT_DELTA FLOAT;
+    V_AVG_COST_IMPACT_PCT FLOAT;
+    V_MAX_ABS_COST_IMPACT_PCT FLOAT;
+    V_INVALID_ML_ACCEPTED_ROWS NUMBER DEFAULT 0;
+    V_INVALID_AUTHORITY_ROWS NUMBER DEFAULT 0;
+    V_INVALID_OVERRIDE_APPLICATION_ROWS NUMBER DEFAULT 0;
+    V_CHANGED_OFFICIAL_NUMERIC_ROWS NUMBER DEFAULT 0;
+    V_CHANGED_OFFICIAL_TEXT_ROWS NUMBER DEFAULT 0;
+    V_SHADOW_SAFETY_FAILURE_ROWS NUMBER DEFAULT 0;
+    V_OFFICIAL_COST_CHANGED_FLAG BOOLEAN DEFAULT FALSE;
+    V_BUSINESS_DECISION_ALLOWED_FLAG BOOLEAN DEFAULT FALSE;
+BEGIN
+    IF (
+        P_VALIDATION_RUN_ID IS NULL
+        OR LENGTH(TRIM(P_VALIDATION_RUN_ID)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_VALIDATION_RUN_ID is required.''
+        );
+    END IF;
+
+    IF (
+        P_VALIDATED_BY IS NULL
+        OR LENGTH(TRIM(P_VALIDATED_BY)) = 0
+    ) THEN
+        RETURN OBJECT_CONSTRUCT(
+            ''status'', ''ERROR'',
+            ''message'', ''P_VALIDATED_BY is required.''
+        );
+    END IF;
+
+    IF (
+        P_DECISION_ID_PREFIX IS NULL
+        OR LENGTH(TRIM(P_DECISION_ID_PREFIX)) = 0
+    ) THEN
+        V_VALIDATION_SCOPE := ''ALL_DECISIONS'';
+    ELSE
+        V_VALIDATION_SCOPE :=
+            ''DECISION_PREFIX:'' || TRIM(P_DECISION_ID_PREFIX);
+    END IF;
+
+    SELECT COUNT(*)
+    INTO :V_EXISTING_RUN_COUNT
+    FROM ML_SHADOW_VALIDATION_RUN_V1
+    WHERE VALIDATION_RUN_ID = :P_VALIDATION_RUN_ID;
+
+    IF (V_EXISTING_RUN_COUNT > 0) THEN
+        SELECT OBJECT_CONSTRUCT_KEEP_NULL(
+            ''status'', VALIDATION_STATUS,
+            ''validation_run_id'', VALIDATION_RUN_ID,
+            ''validation_scope'', VALIDATION_SCOPE,
+            ''deployment_mode'', DEPLOYMENT_MODE,
+            ''total_decisions'', TOTAL_DECISIONS,
+            ''valid_ml_input_rows'', VALID_ML_INPUT_ROWS,
+            ''fallback_trigger_rows'', FALLBACK_TRIGGER_ROWS,
+            ''approved_shadow_override_rows'', APPROVED_SHADOW_OVERRIDE_ROWS,
+            ''ml_advisory_only'', ML_ADVISORY_ONLY_FLAG,
+            ''official_cost_changed'', OFFICIAL_COST_CHANGED_FLAG,
+            ''business_decision_allowed'', BUSINESS_DECISION_ALLOWED_FLAG,
+            ''idempotent_replay'', TRUE
+        )
+        INTO :V_EXISTING_RESULT
+        FROM ML_SHADOW_VALIDATION_RUN_V1
+        WHERE VALIDATION_RUN_ID = :P_VALIDATION_RUN_ID;
+
+        RETURN V_EXISTING_RESULT;
+    END IF;
+
+    SELECT
+        COUNT(*)::NUMBER,
+        COALESCE(
+            COUNT_IF(
+                DEPLOYMENT_MODE <> ''SHADOW''
+                OR AUTO_USE_ALLOWED_FLAG = TRUE
+                OR OFFICIAL_COST_IMPACT_ALLOWED_FLAG = TRUE
+                OR BUSINESS_DECISION_ALLOWED_FLAG = TRUE
+                OR (
+                    MODEL_DOMAIN = ''BMCS''
+                    AND OFFICIAL_COST_IMPACT_ALLOWED_FLAG = TRUE
+                )
+            ),
+            0
+        )::NUMBER
+    INTO
+        :V_ACTIVE_POLICY_COUNT,
+        :V_INVALID_POLICY_ROWS
+    FROM VW_ML_DECISION_POLICY_CURRENT_V1;
+
+    SELECT
+        COUNT(*)::NUMBER,
+        COALESCE(COUNT_IF(VALID_ML_INPUT_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(ML_INPUT_STATUS = ''QUALITY_FAIL''), 0)::NUMBER,
+        COALESCE(COUNT_IF(ML_INPUT_STATUS = ''OOD_REJECT''), 0)::NUMBER,
+        COALESCE(COUNT_IF(ML_INPUT_STATUS = ''INFERENCE_FAIL''), 0)::NUMBER,
+        COALESCE(COUNT_IF(FALLBACK_TRIGGER_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(APPROVED_SHADOW_OVERRIDE_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(PENDING_OVERRIDE_FLAG = TRUE), 0)::NUMBER,
+        ROUND(
+            COALESCE(COUNT_IF(VALID_ML_INPUT_FLAG = TRUE), 0)::FLOAT
+                / NULLIF(COUNT(*)::FLOAT, 0.0::FLOAT) * 100.0::FLOAT,
+            2
+        )::FLOAT,
+        ROUND(
+            COALESCE(COUNT_IF(FALLBACK_TRIGGER_FLAG = TRUE), 0)::FLOAT
+                / NULLIF(COUNT(*)::FLOAT, 0.0::FLOAT) * 100.0::FLOAT,
+            2
+        )::FLOAT,
+        ROUND(AVG(ML_RULE_ABS_DELTA::FLOAT), 6)::FLOAT,
+        ROUND(MAX(ML_RULE_ABS_DELTA::FLOAT), 6)::FLOAT,
+        ROUND(AVG(ML_RULE_PCT_DELTA::FLOAT), 6)::FLOAT,
+        ROUND(MAX(ML_RULE_PCT_DELTA::FLOAT), 6)::FLOAT,
+        ROUND(AVG(ESTIMATED_COST_IMPACT_PCT::FLOAT), 6)::FLOAT,
+        ROUND(MAX(ABS(ESTIMATED_COST_IMPACT_PCT::FLOAT)), 6)::FLOAT,
+        COALESCE(COUNT_IF(ML_VALUE_ACCEPTED_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(
+            COUNT_IF(
+                EFFECTIVE_COST_IMPACT_ALLOWED_FLAG = TRUE
+                OR EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG = TRUE
+            ),
+            0
+        )::NUMBER,
+        COALESCE(COUNT_IF(OVERRIDE_APPLIED_TO_OFFICIAL_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(OFFICIAL_NUMERIC_CHANGED_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(OFFICIAL_TEXT_CHANGED_FLAG = TRUE), 0)::NUMBER,
+        COALESCE(COUNT_IF(SHADOW_SAFETY_PASS_FLAG = FALSE), 0)::NUMBER
+    INTO
+        :V_TOTAL_DECISIONS,
+        :V_VALID_ML_INPUT_ROWS,
+        :V_QUALITY_FAIL_ROWS,
+        :V_OOD_REJECT_ROWS,
+        :V_INFERENCE_FAIL_ROWS,
+        :V_FALLBACK_TRIGGER_ROWS,
+        :V_APPROVED_OVERRIDE_ROWS,
+        :V_PENDING_OVERRIDE_ROWS,
+        :V_VALID_ML_COVERAGE_PCT,
+        :V_FALLBACK_TRIGGER_PCT,
+        :V_AVG_ML_RULE_ABS_DELTA,
+        :V_MAX_ML_RULE_ABS_DELTA,
+        :V_AVG_ML_RULE_PCT_DELTA,
+        :V_MAX_ML_RULE_PCT_DELTA,
+        :V_AVG_COST_IMPACT_PCT,
+        :V_MAX_ABS_COST_IMPACT_PCT,
+        :V_INVALID_ML_ACCEPTED_ROWS,
+        :V_INVALID_AUTHORITY_ROWS,
+        :V_INVALID_OVERRIDE_APPLICATION_ROWS,
+        :V_CHANGED_OFFICIAL_NUMERIC_ROWS,
+        :V_CHANGED_OFFICIAL_TEXT_ROWS,
+        :V_SHADOW_SAFETY_FAILURE_ROWS
+    FROM VW_ML_SHADOW_VALIDATION_DETAIL_V1
+    WHERE (
+        :P_DECISION_ID_PREFIX IS NULL
+        OR LENGTH(TRIM(:P_DECISION_ID_PREFIX)) = 0
+        OR DECISION_ID LIKE CONCAT(TRIM(:P_DECISION_ID_PREFIX), ''%'')
+    );
+
+    IF (
+        V_CHANGED_OFFICIAL_NUMERIC_ROWS > 0
+        OR V_INVALID_OVERRIDE_APPLICATION_ROWS > 0
+        OR V_INVALID_AUTHORITY_ROWS > 0
+        OR V_INVALID_ML_ACCEPTED_ROWS > 0
+    ) THEN
+        V_OFFICIAL_COST_CHANGED_FLAG := TRUE;
+    END IF;
+
+    IF (V_INVALID_AUTHORITY_ROWS > 0) THEN
+        V_BUSINESS_DECISION_ALLOWED_FLAG := TRUE;
+    END IF;
+
+    IF (V_TOTAL_DECISIONS = 0) THEN
+        V_VALIDATION_STATUS := ''FAILED_NO_DECISIONS'';
+    ELSEIF (
+        V_ACTIVE_POLICY_COUNT <> 4
+        OR V_INVALID_POLICY_ROWS > 0
+        OR V_INVALID_ML_ACCEPTED_ROWS > 0
+        OR V_INVALID_AUTHORITY_ROWS > 0
+        OR V_INVALID_OVERRIDE_APPLICATION_ROWS > 0
+        OR V_CHANGED_OFFICIAL_NUMERIC_ROWS > 0
+        OR V_CHANGED_OFFICIAL_TEXT_ROWS > 0
+        OR V_SHADOW_SAFETY_FAILURE_ROWS > 0
+    ) THEN
+        V_VALIDATION_STATUS := ''FAILED_SAFETY_GATE'';
+    ELSE
+        V_VALIDATION_STATUS := ''SUCCESS'';
+    END IF;
+
+    INSERT INTO ML_SHADOW_VALIDATION_RUN_V1 (
+        VALIDATION_RUN_ID,
+        VALIDATION_SCOPE,
+        VALIDATED_BY,
+        VALIDATION_STATUS,
+        DEPLOYMENT_MODE,
+        ACTIVE_POLICY_COUNT,
+        INVALID_POLICY_ROWS,
+        TOTAL_DECISIONS,
+        VALID_ML_INPUT_ROWS,
+        QUALITY_FAIL_ROWS,
+        OOD_REJECT_ROWS,
+        INFERENCE_FAIL_ROWS,
+        FALLBACK_TRIGGER_ROWS,
+        APPROVED_SHADOW_OVERRIDE_ROWS,
+        PENDING_OVERRIDE_ROWS,
+        VALID_ML_COVERAGE_PCT,
+        FALLBACK_TRIGGER_PCT,
+        AVG_ML_RULE_ABS_DELTA,
+        MAX_ML_RULE_ABS_DELTA,
+        AVG_ML_RULE_PCT_DELTA,
+        MAX_ML_RULE_PCT_DELTA,
+        AVG_ESTIMATED_COST_IMPACT_PCT,
+        MAX_ABS_ESTIMATED_COST_IMPACT_PCT,
+        INVALID_ML_ACCEPTED_ROWS,
+        INVALID_AUTHORITY_ROWS,
+        INVALID_OVERRIDE_APPLICATION_ROWS,
+        CHANGED_OFFICIAL_NUMERIC_ROWS,
+        CHANGED_OFFICIAL_TEXT_ROWS,
+        SHADOW_SAFETY_FAILURE_ROWS,
+        ML_ADVISORY_ONLY_FLAG,
+        OFFICIAL_COST_CHANGED_FLAG,
+        BUSINESS_DECISION_ALLOWED_FLAG,
+        VALIDATION_DETAIL,
+        CREATED_AT
+    ) SELECT
+        :P_VALIDATION_RUN_ID,
+        :V_VALIDATION_SCOPE,
+        TRIM(:P_VALIDATED_BY),
+        :V_VALIDATION_STATUS,
+        :V_DEPLOYMENT_MODE,
+        :V_ACTIVE_POLICY_COUNT,
+        :V_INVALID_POLICY_ROWS,
+        :V_TOTAL_DECISIONS,
+        :V_VALID_ML_INPUT_ROWS,
+        :V_QUALITY_FAIL_ROWS,
+        :V_OOD_REJECT_ROWS,
+        :V_INFERENCE_FAIL_ROWS,
+        :V_FALLBACK_TRIGGER_ROWS,
+        :V_APPROVED_OVERRIDE_ROWS,
+        :V_PENDING_OVERRIDE_ROWS,
+        :V_VALID_ML_COVERAGE_PCT,
+        :V_FALLBACK_TRIGGER_PCT,
+        :V_AVG_ML_RULE_ABS_DELTA,
+        :V_MAX_ML_RULE_ABS_DELTA,
+        :V_AVG_ML_RULE_PCT_DELTA,
+        :V_MAX_ML_RULE_PCT_DELTA,
+        :V_AVG_COST_IMPACT_PCT,
+        :V_MAX_ABS_COST_IMPACT_PCT,
+        :V_INVALID_ML_ACCEPTED_ROWS,
+        :V_INVALID_AUTHORITY_ROWS,
+        :V_INVALID_OVERRIDE_APPLICATION_ROWS,
+        :V_CHANGED_OFFICIAL_NUMERIC_ROWS,
+        :V_CHANGED_OFFICIAL_TEXT_ROWS,
+        :V_SHADOW_SAFETY_FAILURE_ROWS,
+        IFF(:V_VALIDATION_STATUS = ''SUCCESS'', TRUE, FALSE),
+        :V_OFFICIAL_COST_CHANGED_FLAG,
+        :V_BUSINESS_DECISION_ALLOWED_FLAG,
+        OBJECT_CONSTRUCT_KEEP_NULL(
+            ''quality_fail_rows'', :V_QUALITY_FAIL_ROWS,
+            ''ood_reject_rows'', :V_OOD_REJECT_ROWS,
+            ''inference_fail_rows'', :V_INFERENCE_FAIL_ROWS,
+            ''fallback_trigger_rows'', :V_FALLBACK_TRIGGER_ROWS,
+            ''approved_shadow_override_rows'', :V_APPROVED_OVERRIDE_ROWS,
+            ''pending_override_rows'', :V_PENDING_OVERRIDE_ROWS,
+            ''invalid_policy_rows'', :V_INVALID_POLICY_ROWS,
+            ''shadow_safety_failure_rows'', :V_SHADOW_SAFETY_FAILURE_ROWS
+        ),
+        CURRENT_TIMESTAMP();
+
+    RETURN OBJECT_CONSTRUCT_KEEP_NULL(
+        ''status'', V_VALIDATION_STATUS,
+        ''phase'', ''PHASE_9D'',
+        ''phase_9_status'',
+            IFF(V_VALIDATION_STATUS = ''SUCCESS'', ''COMPLETE'', ''NOT_COMPLETE''),
+        ''validation_run_id'', P_VALIDATION_RUN_ID,
+        ''validation_scope'', V_VALIDATION_SCOPE,
+        ''deployment_mode'', V_DEPLOYMENT_MODE,
+        ''active_policy_count'', V_ACTIVE_POLICY_COUNT,
+        ''invalid_policy_rows'', V_INVALID_POLICY_ROWS,
+        ''total_decisions'', V_TOTAL_DECISIONS,
+        ''valid_ml_input_rows'', V_VALID_ML_INPUT_ROWS,
+        ''quality_fail_rows'', V_QUALITY_FAIL_ROWS,
+        ''ood_reject_rows'', V_OOD_REJECT_ROWS,
+        ''inference_fail_rows'', V_INFERENCE_FAIL_ROWS,
+        ''fallback_trigger_rows'', V_FALLBACK_TRIGGER_ROWS,
+        ''approved_shadow_override_rows'', V_APPROVED_OVERRIDE_ROWS,
+        ''pending_override_rows'', V_PENDING_OVERRIDE_ROWS,
+        ''valid_ml_coverage_pct'', V_VALID_ML_COVERAGE_PCT,
+        ''fallback_trigger_pct'', V_FALLBACK_TRIGGER_PCT,
+        ''invalid_ml_accepted_rows'', V_INVALID_ML_ACCEPTED_ROWS,
+        ''invalid_authority_rows'', V_INVALID_AUTHORITY_ROWS,
+        ''invalid_override_application_rows'', V_INVALID_OVERRIDE_APPLICATION_ROWS,
+        ''changed_official_numeric_rows'', V_CHANGED_OFFICIAL_NUMERIC_ROWS,
+        ''changed_official_text_rows'', V_CHANGED_OFFICIAL_TEXT_ROWS,
+        ''shadow_safety_failure_rows'', V_SHADOW_SAFETY_FAILURE_ROWS,
+        ''ml_advisory_only'', IFF(V_VALIDATION_STATUS = ''SUCCESS'', TRUE, FALSE),
+        ''official_cost_changed'', V_OFFICIAL_COST_CHANGED_FLAG,
+        ''business_decision_allowed'', V_BUSINESS_DECISION_ALLOWED_FLAG
+    );
+END;
+';
+
+
+CREATE OR REPLACE VIEW VW_ML_SHADOW_VALIDATION_LATEST_V1 AS
+SELECT *
+FROM ML_SHADOW_VALIDATION_RUN_V1
+QUALIFY ROW_NUMBER() OVER (
+    ORDER BY CREATED_AT DESC, VALIDATION_RUN_ID DESC
+) = 1;
+
+
+-- 1. Review Phase 9B decisions and Phase 9C overrides.
+SELECT
+    DECISION_ID,
+    MODEL_DOMAIN,
+    DEPLOYMENT_MODE,
+    RULE_VALUE,
+    RAW_ML_VALUE,
+    RECOMMENDED_ML_VALUE,
+    OFFICIAL_FINAL_NUMERIC_VALUE,
+    OFFICIAL_FINAL_TEXT_STATUS,
+    APPROVED_SHADOW_OVERRIDE_NUMERIC_VALUE,
+    APPROVED_SHADOW_OVERRIDE_TEXT_STATUS,
+    SHADOW_COMPARISON_NUMERIC_VALUE,
+    SHADOW_COMPARISON_TEXT_STATUS,
+    ML_INPUT_STATUS,
+    DECISION_STATUS,
+    DECISION_SOURCE,
+    FALLBACK_REASON,
+    ML_RULE_ABS_DELTA,
+    ML_RULE_PCT_DELTA,
+    APPROVED_SHADOW_OVERRIDE_FLAG,
+    OVERRIDE_APPLIED_TO_OFFICIAL_FLAG,
+    ML_VALUE_ACCEPTED_FLAG,
+    EFFECTIVE_COST_IMPACT_ALLOWED_FLAG,
+    EFFECTIVE_BUSINESS_DECISION_ALLOWED_FLAG,
+    OFFICIAL_NUMERIC_CHANGED_FLAG,
+    OFFICIAL_TEXT_CHANGED_FLAG,
+    SHADOW_SAFETY_PASS_FLAG
+FROM VW_ML_SHADOW_VALIDATION_DETAIL_V1
+WHERE DECISION_ID LIKE 'PHASE9B_%'
+ORDER BY MODEL_DOMAIN, DECISION_ID;
+
+-- 2. Run the idempotent Phase 9D closure validation.
+CALL RUN_ML_SHADOW_VALIDATION_V1(
+    'PHASE9D_SHADOW_VALIDATION_001',
+    'PHASE9B_',
+    'PHASE9D_TEST'
+);
+
+-- 3. Review the stored validation result.
+SELECT *
+FROM ML_SHADOW_VALIDATION_RUN_V1
+WHERE VALIDATION_RUN_ID = 'PHASE9D_SHADOW_VALIDATION_001';
+
+-- 4. Review model-level and overall shadow metrics.
+SELECT *
+FROM VW_ML_SHADOW_VALIDATION_SUMMARY_V1
+ORDER BY IFF(MODEL_DOMAIN = 'ALL', 0, 1), MODEL_DOMAIN;
+
+-- 5. Final integrity gate. Expected all invalid/changed values = 0.
+SELECT
+    COUNT(*)::NUMBER AS TOTAL_VALIDATION_RUNS,
+    COALESCE(COUNT_IF(VALIDATION_STATUS = 'SUCCESS'), 0)::NUMBER
+        AS SUCCESSFUL_VALIDATION_RUNS,
+    COALESCE(SUM(INVALID_POLICY_ROWS), 0)::NUMBER
+        AS INVALID_POLICY_ROWS,
+    COALESCE(SUM(INVALID_ML_ACCEPTED_ROWS), 0)::NUMBER
+        AS INVALID_ML_ACCEPTED_ROWS,
+    COALESCE(SUM(INVALID_AUTHORITY_ROWS), 0)::NUMBER
+        AS INVALID_AUTHORITY_ROWS,
+    COALESCE(SUM(INVALID_OVERRIDE_APPLICATION_ROWS), 0)::NUMBER
+        AS INVALID_OVERRIDE_APPLICATION_ROWS,
+    COALESCE(SUM(CHANGED_OFFICIAL_NUMERIC_ROWS), 0)::NUMBER
+        AS CHANGED_OFFICIAL_NUMERIC_ROWS,
+    COALESCE(SUM(CHANGED_OFFICIAL_TEXT_ROWS), 0)::NUMBER
+        AS CHANGED_OFFICIAL_TEXT_ROWS,
+    COALESCE(SUM(SHADOW_SAFETY_FAILURE_ROWS), 0)::NUMBER
+        AS SHADOW_SAFETY_FAILURE_ROWS,
+    COALESCE(COUNT_IF(ML_ADVISORY_ONLY_FLAG = FALSE), 0)::NUMBER
+        AS INVALID_ADVISORY_MODE_ROWS,
+    COALESCE(COUNT_IF(OFFICIAL_COST_CHANGED_FLAG = TRUE), 0)::NUMBER
+        AS OFFICIAL_COST_CHANGED_ROWS,
+    COALESCE(COUNT_IF(BUSINESS_DECISION_ALLOWED_FLAG = TRUE), 0)::NUMBER
+        AS BUSINESS_DECISION_ALLOWED_ROWS
+FROM ML_SHADOW_VALIDATION_RUN_V1
+WHERE VALIDATION_RUN_ID = 'PHASE9D_SHADOW_VALIDATION_001';
+
+-- 6. Latest Phase 9 closure result.
+SELECT * FROM VW_ML_SHADOW_VALIDATION_LATEST_V1;
