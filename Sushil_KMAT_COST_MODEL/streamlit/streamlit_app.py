@@ -3,7 +3,7 @@ import re
 import os
 from datetime import datetime, date
 from decimal import Decimal
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -11,20 +11,46 @@ from snowflake.snowpark.context import get_active_session
 
 
 # ============================================================
-# KMAT Truck Cost Model - Phase 7C Streamlit UI - Uniform KPI Layout
-# Adds uniform KPI cards across Configure, History, Compare, Component Impact, RFQ/BMCS, and Cortex tabs,
-# while preserving Phase 4B scenario history, comparison, batch demo,
-# component impact, and exportable tables.
+# KMAT Truck Cost Model — Final Governed Streamlit Integration
 #
-# Backend expected from Phases 1, 2, 5A, 5B, 5C, 6A-6D, and 7A:
-# - Database: KMAT_COST_MODEL_DB
-# - Procedures: CORE_INTERNAL.RUN_KMAT_COST_SIMULATION(SIMULATION_ID), CORE_INTERNAL.RUN_CORTEX_RFQ_INTAKE_PIPELINE(RFQ_ID), CORE_INTERNAL.RUN_CORTEX_RFQ_QUOTE_PIPELINE(RFQ_ID)
-# - Input tables in CORE_INPUT, including Phase 5A risk tables, Phase 6 RFQ/BMCS tables, and Phase 7A RFQ_DOC_STAGE/Cortex fields
-# - Output tables in CORE_OUTPUT, including Phase 5B risk columns and Phase 6C BMCS trust columns
+# Preserves the complete Cortex RFQ, BMCS, configuration, risk,
+# history, comparison, component-impact, batch-demo, monitoring,
+# and verified-outcome workflows.
+#
+# Financial truth:
+# - CORE_INTERNAL.RUN_KMAT_COST_SIMULATION_GOVERNED_V3 remains
+#   the deterministic governed simulation entry point.
+# - The UI never activates a model deployment or enables runtime
+#   authority.
+# - Candidate runtime use is available only through the secure
+#   Phase 13B resolver and only when the database control plane
+#   reports an open path with complete inference metadata.
+#
+# Security and governance display:
+# - Phase 13A runtime authority, domain switches and decisions.
+# - Phase 13B grant compliance, policy seals and secure identity.
+# - Corrected approved-override precedence through the V2 view.
 # ============================================================
 
 DB_NAME = "KMAT_COST_MODEL_DB"
 KMAT_ID = "KMAT_TRUCK_01"
+
+SECURE_ACTIVATION_ENTRY_POINT = (
+    f"{DB_NAME}.CORE_ML."
+    "ACTIVATE_APPROVED_ML_DEPLOYMENT_SECURE_V1"
+)
+SECURE_RUNTIME_RESOLVER = (
+    f"{DB_NAME}.CORE_ML."
+    "RESOLVE_ML_RUNTIME_AUTHORITY_SECURE_V1"
+)
+SECURE_OVERRIDE_SUBMIT = (
+    f"{DB_NAME}.CORE_ML."
+    "SUBMIT_ML_DECISION_OVERRIDE_V2"
+)
+SECURE_OVERRIDE_REVIEW = (
+    f"{DB_NAME}.CORE_ML."
+    "REVIEW_ML_DECISION_OVERRIDE_V2"
+)
 
 session = get_active_session()
 
@@ -73,6 +99,64 @@ def as_float(value) -> float:
         return 0.0
 
 
+def is_missing(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def optional_rate(value) -> str:
+    if is_missing(value):
+        return "—"
+    return f"{as_float(value) * 100.0:.2f}%"
+
+
+def optional_multiplier(value, decimals: int = 4) -> str:
+    if is_missing(value):
+        return "—"
+    return f"{as_float(value):.{decimals}f}x"
+
+
+def optional_score(value) -> str:
+    if is_missing(value):
+        return "—"
+    return f"{as_float(value):.2f}"
+
+
+def yes_no(value) -> str:
+    return "Yes" if bool(value) else "No"
+
+
+def parse_procedure_result(raw_result) -> Dict:
+    if raw_result is None:
+        return {}
+
+    if isinstance(raw_result, dict):
+        return raw_result
+
+    if hasattr(raw_result, "as_dict"):
+        try:
+            return raw_result.as_dict()
+        except Exception:
+            pass
+
+    try:
+        return json.loads(raw_result)
+    except Exception:
+        pass
+
+    try:
+        return json.loads(str(raw_result))
+    except Exception:
+        return {
+            "status": "UNKNOWN",
+            "raw_result": str(raw_result),
+        }
+
+
 def money(value) -> str:
     return f"${as_float(value):,.2f}"
 
@@ -83,6 +167,35 @@ def pct(value) -> str:
 
 def utc_stamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+
+def optional_text(value, fallback: str = "—") -> str:
+    if is_missing(value):
+        return fallback
+    cleaned = str(value).strip()
+    return cleaned if cleaned else fallback
+
+
+def first_present(
+    row: pd.Series,
+    keys: List[str],
+) -> Tuple[Optional[str], Any]:
+    for key in keys:
+        if key in row.index and not is_missing(row.get(key)):
+            return key, row.get(key)
+    return None, None
+
+
+def make_runtime_decision_id(
+    model_domain: str,
+    simulation_id: str,
+) -> str:
+    raw_id = (
+        f"RT_{model_domain}_{simulation_id}_{utc_stamp()}"
+        .upper()
+    )
+    cleaned = re.sub(r"[^A-Z0-9_-]+", "_", raw_id)
+    return cleaned[:60]
 
 
 # -----------------------------
@@ -231,14 +344,482 @@ def reset_and_insert_simulation(
 
 
 def run_kmat_engine(simulation_id: str) -> Dict:
+    """
+    Run the deterministic governed cost flow.
+
+    This is intentionally not replaced by a deployment activation
+    procedure. Model activation and deterministic cost simulation are
+    different responsibilities.
+    """
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_KMAT_COST_SIMULATION({sql_literal(simulation_id)})
+        CALL {DB_NAME}.CORE_INTERNAL.RUN_KMAT_COST_SIMULATION_GOVERNED_V3(
+            {sql_literal(simulation_id)}
+        )
     """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
+    raw_result = rows[0][0] if rows else None
+    return parse_procedure_result(raw_result)
+
+
+@st.cache_data(ttl=30)
+def load_session_identity() -> Dict[str, Any]:
+    df = query_df("""
+        SELECT
+            CURRENT_USER()::VARCHAR
+                AS ACTUAL_USER,
+            CURRENT_ROLE()::VARCHAR
+                AS ACTIVE_ROLE,
+            CURRENT_WAREHOUSE()::VARCHAR
+                AS ACTIVE_WAREHOUSE,
+            CURRENT_DATABASE()::VARCHAR
+                AS ACTIVE_DATABASE,
+            CURRENT_SCHEMA()::VARCHAR
+                AS ACTIVE_SCHEMA,
+            CURRENT_SESSION()::NUMBER
+                AS SESSION_ID
+    """)
+
+    if df.empty:
+        return {}
+
+    return df.iloc[0].to_dict()
+
+
+@st.cache_data(ttl=30)
+def load_runtime_authority_dashboard() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_PHASE13A_RUNTIME_AUTHORITY_V1
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+@st.cache_data(ttl=30)
+def load_security_control_dashboard() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_PHASE13B_SECURITY_DASHBOARD_V1
+    """)
+
+
+@st.cache_data(ttl=30)
+def load_policy_seal_integrity() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_ML_POLICY_VERSION_SEAL_INTEGRITY_V1
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+def load_streamlit_runtime_inputs(
+    simulation_id: str,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_STREAMLIT_RUNTIME_INPUT_V1
+        WHERE SIMULATION_ID =
+              {sql_literal(simulation_id)}
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+def load_runtime_decisions(
+    simulation_id: str,
+    limit: int = 100,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT
+            RUNTIME_DECISION_ID,
+            RUNTIME_AUTHORITY_ID,
+            MODEL_DOMAIN,
+            AUTHORITY_MODE,
+
+            POLICY_ID,
+            POLICY_VERSION,
+
+            SIMULATION_ID,
+            RULE_VALUE,
+            CANDIDATE_VALUE,
+            FINAL_RUNTIME_VALUE,
+
+            GLOBAL_SWITCH_OPEN_FLAG,
+            DOMAIN_SWITCH_OPEN_FLAG,
+            AUTHORITY_ENABLED_FLAG,
+            REQUEST_FRESH_FLAG,
+            POLICY_MATCH_FLAG,
+            POLICY_FINGERPRINT_MATCH_FLAG,
+            PRODUCTION_EXIT_GATE_PASS_FLAG,
+
+            QUALITY_PASS_FLAG,
+            OOD_FLAG,
+            OVERALL_GUARDRAIL_PASS_FLAG,
+            ENGINEER_APPROVED_FLAG,
+            CAPACITY_RESERVED_FLAG,
+
+            RUNTIME_AUTHORISED_FLAG,
+            OFFICIAL_COST_IMPACT_AUTHORISED_FLAG,
+            BUSINESS_DECISION_AUTHORISED_FLAG,
+
+            FINAL_RUNTIME_SOURCE,
+            DECISION_STATUS,
+            DECISION_REASON,
+
+            REQUESTED_BY,
+            DECIDED_AT
+        FROM {DB_NAME}.CORE_ML
+            .VW_ML_RUNTIME_DECISION_CURRENT_V1
+        WHERE SIMULATION_ID =
+              {sql_literal(simulation_id)}
+        ORDER BY DECIDED_AT DESC
+        LIMIT {int(limit)}
+    """)
+
+
+def load_approved_override_display(
+    simulation_id: str,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_ML_DECISION_WITH_APPROVED_OVERRIDE_V2
+        WHERE SIMULATION_ID =
+              {sql_literal(simulation_id)}
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+def resolve_secure_runtime_authority(
+    runtime_decision_id: str,
+    model_domain: str,
+    simulation_id: str,
+
+    rule_value,
+    candidate_value,
+
+    quality_pass_flag: bool,
+    ood_flag: bool,
+
+    engineer_approved_flag: bool,
+    engineer_approval_reference: Optional[str],
+) -> Dict:
+    """
+    Call the Phase 13B secure runtime resolver.
+
+    The procedure captures CURRENT_USER() inside Snowflake. This UI does
+    not pass a caller-controlled actor name.
+    """
+    runtime_decision_id = normalize_id(
+        runtime_decision_id,
+        "Runtime decision ID",
+    )
+    model_domain = str(model_domain or "").strip().upper()
+    if model_domain not in {"CSS", "FMIS", "TDS", "BMCS"}:
+        raise ValueError("Model domain must be CSS, FMIS, TDS, or BMCS.")
+
+    simulation_id = normalize_id(
+        simulation_id,
+        "Simulation ID",
+    )
+
+    def numeric_sql(value) -> str:
+        if is_missing(value):
+            return "NULL"
+        return str(float(value))
+
+    rows = run_sql(f"""
+        CALL {SECURE_RUNTIME_RESOLVER}(
+            {sql_literal(runtime_decision_id)},
+            {sql_literal(model_domain)},
+            {sql_literal(simulation_id)},
+
+            {numeric_sql(rule_value)},
+            {numeric_sql(candidate_value)},
+
+            {"TRUE" if bool(quality_pass_flag) else "FALSE"},
+            {"TRUE" if bool(ood_flag) else "FALSE"},
+
+            {"TRUE" if bool(engineer_approved_flag) else "FALSE"},
+            {sql_literal(engineer_approval_reference)}
+        )
+    """)
+
+    raw_result = rows[0][0] if rows else None
+    return parse_procedure_result(raw_result)
+
+
+def extract_runtime_input(
+    governed_row: pd.Series,
+    model_domain: str,
+) -> Dict[str, Any]:
+    """
+    Read runtime inputs already produced by the governed decision view.
+
+    Candidate execution is disabled when required quality/OOD metadata is
+    unavailable. The UI never invents those safety flags.
+    """
+    domain = str(model_domain or "").strip().upper()
+
+    input_map = {
+        "CSS": {
+            "rule": ["CSS_RULE_VALUE"],
+            "candidate": [
+                "CSS_ML_VALUE",
+                "CSS_RECOMMENDED_ML_VALUE",
+            ],
+            "quality": [
+                "CSS_FEATURE_QUALITY_PASS_FLAG",
+                "CSS_QUALITY_PASS_FLAG",
+            ],
+            "ood": [
+                "CSS_MODEL_OOD_FLAG",
+                "CSS_OOD_FLAG",
+            ],
+        },
+        "FMIS": {
+            "rule": ["FMIS_RULE_VALUE"],
+            "candidate": [
+                "FMIS_ML_VALUE",
+                "FMIS_RECOMMENDED_ML_VALUE",
+            ],
+            "quality": [
+                "FMIS_FEATURE_QUALITY_PASS_FLAG",
+                "FMIS_QUALITY_PASS_FLAG",
+            ],
+            "ood": [
+                "FMIS_MODEL_OOD_FLAG",
+                "FMIS_OOD_FLAG",
+            ],
+        },
+        "TDS": {
+            "rule": ["TDS_RULE_VALUE"],
+            "candidate": [
+                "TDS_ML_VALUE",
+                "TDS_RECOMMENDED_ML_VALUE",
+            ],
+            "quality": [
+                "TDS_FEATURE_QUALITY_PASS_FLAG",
+                "TDS_QUALITY_PASS_FLAG",
+            ],
+            "ood": [
+                "TDS_MODEL_OOD_FLAG",
+                "TDS_OOD_FLAG",
+            ],
+        },
+        "BMCS": {
+            "rule": [
+                "BMCS_RULE_PROBABILITY",
+                "BMCS_RULE_VALUE",
+            ],
+            "candidate": [
+                "BMCS_ML_PROBABILITY",
+                "BMCS_RAW_ML_VALUE",
+            ],
+            "quality": [
+                "BMCS_FEATURE_QUALITY_PASS_FLAG",
+                "BMCS_QUALITY_PASS_FLAG",
+            ],
+            "ood": [
+                "BMCS_MODEL_OOD_FLAG",
+                "BMCS_OOD_FLAG",
+            ],
+        },
+    }
+
+    if domain not in input_map:
+        return {
+            "ready": False,
+            "reason": "Unsupported model domain.",
+        }
+
+    keys = input_map[domain]
+    rule_key, rule_value = first_present(
+        governed_row,
+        keys["rule"],
+    )
+    candidate_key, candidate_value = first_present(
+        governed_row,
+        keys["candidate"],
+    )
+    quality_key, quality_value = first_present(
+        governed_row,
+        keys["quality"],
+    )
+    ood_key, ood_value = first_present(
+        governed_row,
+        keys["ood"],
+    )
+
+    missing_fields = []
+    if candidate_key is None:
+        missing_fields.append("candidate value")
+    if quality_key is None:
+        missing_fields.append("quality flag")
+    if ood_key is None:
+        missing_fields.append("OOD flag")
+    if domain != "BMCS" and rule_key is None:
+        missing_fields.append("rule value")
+
+    return {
+        "ready": len(missing_fields) == 0,
+        "reason": (
+            ""
+            if not missing_fields
+            else "Missing " + ", ".join(missing_fields) + "."
+        ),
+        "rule_key": rule_key,
+        "rule_value": rule_value,
+        "candidate_key": candidate_key,
+        "candidate_value": candidate_value,
+        "quality_key": quality_key,
+        "quality_pass_flag": (
+            bool(quality_value)
+            if quality_key is not None
+            else False
+        ),
+        "ood_key": ood_key,
+        "ood_flag": (
+            bool(ood_value)
+            if ood_key is not None
+            else True
+        ),
+        "inference_success_flag": False,
+        "source": "PHASE10C_FALLBACK",
+    }
+
+
+def extract_runtime_input_from_secure_view(
+    runtime_input_df: pd.DataFrame,
+    model_domain: str,
+    governed_row: pd.Series,
+) -> Dict[str, Any]:
+    domain = str(model_domain or "").strip().upper()
+
+    if (
+        not runtime_input_df.empty
+        and "MODEL_DOMAIN" in runtime_input_df.columns
+    ):
+        matched = runtime_input_df[
+            runtime_input_df[
+                "MODEL_DOMAIN"
+            ].astype(str).str.upper()
+            == domain
+        ]
+
+        if not matched.empty:
+            row = matched.iloc[0]
+
+            return {
+                "ready": bool(
+                    row.get(
+                        "RUNTIME_INPUT_READY_FLAG",
+                        False,
+                    )
+                ),
+                "reason": optional_text(
+                    row.get(
+                        "RUNTIME_INPUT_STATUS"
+                    ),
+                    "RUNTIME_INPUT_NOT_READY",
+                ),
+                "decision_id": row.get("DECISION_ID"),
+                "rule_key": "RUNTIME_RULE_VALUE",
+                "rule_value": row.get(
+                    "RUNTIME_RULE_VALUE"
+                ),
+                "candidate_key": (
+                    "RUNTIME_CANDIDATE_VALUE"
+                ),
+                "candidate_value": row.get(
+                    "RUNTIME_CANDIDATE_VALUE"
+                ),
+                "quality_key": (
+                    "FEATURE_QUALITY_PASS_FLAG"
+                ),
+                "quality_pass_flag": bool(
+                    row.get(
+                        "FEATURE_QUALITY_PASS_FLAG",
+                        False,
+                    )
+                ),
+                "ood_key": "MODEL_OOD_FLAG",
+                "ood_flag": bool(
+                    row.get(
+                        "MODEL_OOD_FLAG",
+                        True,
+                    )
+                ),
+                "inference_success_flag": bool(
+                    row.get(
+                        "MODEL_INFERENCE_SUCCESS_FLAG",
+                        False,
+                    )
+                ),
+                "source": (
+                    "VW_KMAT_STREAMLIT_RUNTIME_INPUT_V1"
+                ),
+            }
+
+    fallback = extract_runtime_input(
+        governed_row,
+        domain,
+    )
+    fallback["reason"] = (
+        "Secure runtime-input view unavailable or returned no "
+        "latest decision row. "
+        + fallback.get("reason", "")
+    ).strip()
+    return fallback
+
+
+def prepare_governance_for_existing_simulation(
+    simulation_id: str,
+) -> Dict:
+    """
+    Attach Phase 10A and Phase 10B governance to an already-computed
+    simulation, such as an RFQ quote result.
+
+    This does not rerun the deterministic cost engine and therefore does
+    not overwrite the RFQ pipeline's final BMCS trust patch.
+    """
+    phase10a_rows = run_sql(f"""
+        CALL {DB_NAME}.CORE_ML.PREPARE_KMAT_GOVERNED_COST_INPUT_V2(
+            {sql_literal(simulation_id)}
+        )
+    """)
+    phase10a_raw = phase10a_rows[0][0] if phase10a_rows else None
+    phase10a_result = parse_procedure_result(phase10a_raw)
+
+    if phase10a_result.get("status") != "SUCCESS":
+        return {
+            "status": "ERROR",
+            "phase": "PHASE_10C",
+            "message": "Phase 10A governance preparation failed.",
+            "simulation_id": simulation_id,
+            "phase10a_result": phase10a_result,
+        }
+
+    phase10b_rows = run_sql(f"""
+        CALL {DB_NAME}.CORE_ML.RESOLVE_KMAT_COST_FACTOR_HIERARCHY_V1(
+            {sql_literal(simulation_id)}
+        )
+    """)
+    phase10b_raw = phase10b_rows[0][0] if phase10b_rows else None
+    phase10b_result = parse_procedure_result(phase10b_raw)
+
+    return {
+        "status": (
+            "SUCCESS"
+            if phase10b_result.get("status") == "SUCCESS"
+            else "ERROR"
+        ),
+        "phase": "PHASE_10C",
+        "simulation_id": simulation_id,
+        "phase10a_result": phase10a_result,
+        "phase10b_result": phase10b_result,
+    }
 
 
 def run_one_simulation(
@@ -337,6 +918,474 @@ def load_summary(simulation_id: str) -> pd.DataFrame:
             CALCULATED_AT
         FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COST_SUMMARY
         WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+    """)
+
+
+def load_phase10c_decision_display(
+    simulation_id: str,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML.VW_KMAT_PHASE10C_DECISION_DISPLAY_V1
+        WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+    """)
+
+
+def load_phase10c_audit(
+    simulation_id: str,
+    limit: int = 50,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT
+            PHASE_NAME,
+            AUDIT_EVENT_ID,
+            AUDIT_EVENT_TYPE,
+            EVENT_STATUS,
+            EVENT_REASON,
+
+            FINAL_SCRAP_RATE,
+            FINAL_FMIS_MULTIPLIER,
+            FINAL_TDS_FACTOR,
+            FINAL_BMCS_STATUS,
+
+            SAFETY_GATE_PASS_FLAG,
+            COST_ENGINE_CONSUMPTION_ALLOWED_FLAG,
+
+            EVENT_ACTOR,
+            EVENT_AT
+        FROM (
+            SELECT
+                'PHASE_10A' AS PHASE_NAME,
+                AUDIT_EVENT_ID,
+                AUDIT_EVENT_TYPE,
+                INTEGRATION_STATUS AS EVENT_STATUS,
+                INTEGRATION_REASON AS EVENT_REASON,
+
+                FINAL_SCRAP_RATE::FLOAT
+                    AS FINAL_SCRAP_RATE,
+                FINAL_FMIS_MULTIPLIER::FLOAT
+                    AS FINAL_FMIS_MULTIPLIER,
+                FINAL_TDS_FACTOR::FLOAT
+                    AS FINAL_TDS_FACTOR,
+                BMCS_SHADOW_COMPARISON_STATUS
+                    AS FINAL_BMCS_STATUS,
+
+                SAFETY_GATE_PASS_FLAG,
+                COST_ENGINE_CONSUMPTION_ALLOWED_FLAG,
+
+                AUDITED_BY AS EVENT_ACTOR,
+                AUDITED_AT AS EVENT_AT
+            FROM {DB_NAME}.CORE_ML.KMAT_GOVERNED_COST_INPUT_AUDIT_V2
+            WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+
+            UNION ALL
+
+            SELECT
+                'PHASE_10B' AS PHASE_NAME,
+                AUDIT_EVENT_ID,
+                AUDIT_EVENT_TYPE,
+                RESOLUTION_STATUS AS EVENT_STATUS,
+                RESOLUTION_REASON AS EVENT_REASON,
+
+                RESOLVED_SCRAP_RATE::FLOAT
+                    AS FINAL_SCRAP_RATE,
+                RESOLVED_FMIS_MULTIPLIER::FLOAT
+                    AS FINAL_FMIS_MULTIPLIER,
+                RESOLVED_TDS_FACTOR::FLOAT
+                    AS FINAL_TDS_FACTOR,
+                RESOLVED_BMCS_STATUS
+                    AS FINAL_BMCS_STATUS,
+
+                SAFETY_GATE_PASS_FLAG,
+                COST_ENGINE_CONSUMPTION_ALLOWED_FLAG,
+
+                AUDITED_BY AS EVENT_ACTOR,
+                AUDITED_AT AS EVENT_AT
+            FROM {DB_NAME}.CORE_ML.KMAT_COST_FACTOR_RESOLUTION_AUDIT_V1
+            WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+        )
+        ORDER BY EVENT_AT DESC
+        LIMIT {int(limit)}
+    """)
+
+
+def build_governed_factor_table(row: pd.Series) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Factor": "CSS Scrap Rate",
+                "Rule / Official": optional_rate(
+                    row.get("CSS_RULE_VALUE")
+                ),
+                "ML Advisory": optional_rate(
+                    row.get("CSS_ML_VALUE")
+                ),
+                "Approved Override": optional_rate(
+                    row.get("CSS_OVERRIDE_VALUE")
+                ),
+                "Safe Default": optional_rate(
+                    row.get("CSS_SAFE_DEFAULT_VALUE")
+                ),
+                "Final Governed": optional_rate(
+                    row.get("RESOLVED_SCRAP_RATE")
+                ),
+                "Final Source": str(
+                    row.get("CSS_RESOLVED_SOURCE", "N/A")
+                ),
+                "ML Eligible": yes_no(
+                    row.get("CSS_ML_ELIGIBLE_FLAG", False)
+                ),
+                "Override Eligible": yes_no(
+                    row.get(
+                        "CSS_OVERRIDE_ELIGIBLE_FLAG",
+                        False,
+                    )
+                ),
+            },
+            {
+                "Factor": "FMIS Material Multiplier",
+                "Rule / Official": optional_multiplier(
+                    row.get("FMIS_RULE_VALUE")
+                ),
+                "ML Advisory": optional_multiplier(
+                    row.get("FMIS_ML_VALUE")
+                ),
+                "Approved Override": optional_multiplier(
+                    row.get("FMIS_OVERRIDE_VALUE")
+                ),
+                "Safe Default": optional_multiplier(
+                    row.get("FMIS_SAFE_DEFAULT_VALUE")
+                ),
+                "Final Governed": optional_multiplier(
+                    row.get("RESOLVED_FMIS_MULTIPLIER")
+                ),
+                "Final Source": str(
+                    row.get("FMIS_RESOLVED_SOURCE", "N/A")
+                ),
+                "ML Eligible": yes_no(
+                    row.get("FMIS_ML_ELIGIBLE_FLAG", False)
+                ),
+                "Override Eligible": yes_no(
+                    row.get(
+                        "FMIS_OVERRIDE_ELIGIBLE_FLAG",
+                        False,
+                    )
+                ),
+            },
+            {
+                "Factor": "TDS Tooling Factor",
+                "Rule / Official": optional_multiplier(
+                    row.get("TDS_RULE_VALUE"),
+                    2,
+                ),
+                "ML Advisory": optional_multiplier(
+                    row.get("TDS_ML_VALUE"),
+                    2,
+                ),
+                "Approved Override": optional_multiplier(
+                    row.get("TDS_OVERRIDE_VALUE"),
+                    2,
+                ),
+                "Safe Default": optional_multiplier(
+                    row.get("TDS_SAFE_DEFAULT_VALUE"),
+                    2,
+                ),
+                "Final Governed": optional_multiplier(
+                    row.get("RESOLVED_TDS_FACTOR"),
+                    2,
+                ),
+                "Final Source": str(
+                    row.get("TDS_RESOLVED_SOURCE", "N/A")
+                ),
+                "ML Eligible": yes_no(
+                    row.get("TDS_ML_ELIGIBLE_FLAG", False)
+                ),
+                "Override Eligible": yes_no(
+                    row.get(
+                        "TDS_OVERRIDE_ELIGIBLE_FLAG",
+                        False,
+                    )
+                ),
+            },
+        ]
+    )
+
+
+def build_model_lineage_table(row: pd.Series) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Domain": "CSS",
+                "Deployment Mode": row.get(
+                    "CSS_DEPLOYMENT_MODE",
+                    "N/A",
+                ),
+                "Policy Version": row.get(
+                    "CSS_POLICY_VERSION",
+                    "N/A",
+                ),
+                "Model Name": row.get(
+                    "CSS_MODEL_NAME",
+                    "N/A",
+                ),
+                "Model Version": row.get(
+                    "CSS_MODEL_VERSION",
+                    "N/A",
+                ),
+                "Feature Set": row.get(
+                    "CSS_FEATURE_SET_VERSION",
+                    "N/A",
+                ),
+            },
+            {
+                "Domain": "FMIS",
+                "Deployment Mode": row.get(
+                    "FMIS_DEPLOYMENT_MODE",
+                    "N/A",
+                ),
+                "Policy Version": row.get(
+                    "FMIS_POLICY_VERSION",
+                    "N/A",
+                ),
+                "Model Name": row.get(
+                    "FMIS_MODEL_NAME",
+                    "N/A",
+                ),
+                "Model Version": row.get(
+                    "FMIS_MODEL_VERSION",
+                    "N/A",
+                ),
+                "Feature Set": row.get(
+                    "FMIS_FEATURE_SET_VERSION",
+                    "N/A",
+                ),
+            },
+            {
+                "Domain": "TDS",
+                "Deployment Mode": row.get(
+                    "TDS_DEPLOYMENT_MODE",
+                    "N/A",
+                ),
+                "Policy Version": row.get(
+                    "TDS_POLICY_VERSION",
+                    "N/A",
+                ),
+                "Model Name": row.get(
+                    "TDS_MODEL_NAME",
+                    "N/A",
+                ),
+                "Model Version": row.get(
+                    "TDS_MODEL_VERSION",
+                    "N/A",
+                ),
+                "Feature Set": row.get(
+                    "TDS_FEATURE_SET_VERSION",
+                    "N/A",
+                ),
+            },
+            {
+                "Domain": "BMCS",
+                "Deployment Mode": row.get(
+                    "BMCS_DEPLOYMENT_MODE",
+                    "N/A",
+                ),
+                "Policy Version": row.get(
+                    "BMCS_POLICY_VERSION",
+                    "N/A",
+                ),
+                "Model Name": row.get(
+                    "BMCS_MODEL_NAME",
+                    "N/A",
+                ),
+                "Model Version": row.get(
+                    "BMCS_MODEL_VERSION",
+                    "N/A",
+                ),
+                "Feature Set": row.get(
+                    "BMCS_FEATURE_SET_VERSION",
+                    "N/A",
+                ),
+            },
+        ]
+    )
+
+
+def record_model_actual_outcome(
+    outcome_id: str,
+    simulation_id: str,
+    model_domain: str,
+    outcome_date,
+    actual_numeric_value,
+    actual_text_status: str,
+    actual_mapping_correct_flag,
+    outcome_source: str,
+    evidence_reference: str,
+    notes: str,
+    recorded_by: str,
+) -> Dict:
+    numeric_sql = (
+        "NULL"
+        if actual_numeric_value is None
+        else str(float(actual_numeric_value))
+    )
+    mapping_sql = (
+        "NULL"
+        if actual_mapping_correct_flag is None
+        else (
+            "TRUE"
+            if bool(actual_mapping_correct_flag)
+            else "FALSE"
+        )
+    )
+
+    rows = run_sql(f"""
+        CALL {DB_NAME}.CORE_ML
+            .RECORD_KMAT_MODEL_ACTUAL_OUTCOME_V1(
+                {sql_literal(outcome_id)},
+                {sql_literal(simulation_id)},
+                {sql_literal(model_domain)},
+                {sql_literal(str(outcome_date))}::DATE,
+
+                {numeric_sql},
+                {sql_literal(actual_text_status)},
+                {mapping_sql},
+
+                {sql_literal(outcome_source)},
+                {sql_literal(evidence_reference)},
+                {sql_literal(notes)},
+                {sql_literal(recorded_by)}
+            )
+    """)
+
+    raw_result = rows[0][0] if rows else None
+    return parse_procedure_result(raw_result)
+
+
+def record_cost_actual_outcome(
+    cost_outcome_id: str,
+    simulation_id: str,
+    outcome_date,
+    actual_material_cost,
+    actual_labor_cost,
+    actual_machine_cost,
+    actual_overhead_cost,
+    actual_total_cost,
+    actual_final_price,
+    outcome_source: str,
+    evidence_reference: str,
+    notes: str,
+    recorded_by: str,
+) -> Dict:
+    def optional_number(value) -> str:
+        if value is None:
+            return "NULL"
+        return str(float(value))
+
+    rows = run_sql(f"""
+        CALL {DB_NAME}.CORE_ML
+            .RECORD_KMAT_COST_ACTUAL_OUTCOME_V1(
+                {sql_literal(cost_outcome_id)},
+                {sql_literal(simulation_id)},
+                {sql_literal(str(outcome_date))}::DATE,
+
+                {optional_number(actual_material_cost)},
+                {optional_number(actual_labor_cost)},
+                {optional_number(actual_machine_cost)},
+                {optional_number(actual_overhead_cost)},
+
+                {optional_number(actual_total_cost)},
+                {optional_number(actual_final_price)},
+
+                {sql_literal(outcome_source)},
+                {sql_literal(evidence_reference)},
+                {sql_literal(notes)},
+                {sql_literal(recorded_by)}
+            )
+    """)
+
+    raw_result = rows[0][0] if rows else None
+    return parse_procedure_result(raw_result)
+
+
+def run_phase11a_monitoring(
+    monitoring_run_id: str,
+    run_by: str,
+) -> Dict:
+    rows = run_sql(f"""
+        CALL {DB_NAME}.CORE_ML.RUN_KMAT_MONITORING_V1(
+            {sql_literal(monitoring_run_id)},
+            {sql_literal(run_by)}
+        )
+    """)
+    raw_result = rows[0][0] if rows else None
+    return parse_procedure_result(raw_result)
+
+
+def load_phase11a_dashboard() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_PHASE11A_MONITORING_DASHBOARD_V1
+        ORDER BY
+            CASE ALERT_STATUS
+                WHEN 'CRITICAL' THEN 1
+                WHEN 'WARNING' THEN 2
+                WHEN 'NO_DATA' THEN 3
+                WHEN 'INSUFFICIENT_DATA' THEN 4
+                WHEN 'HEALTHY' THEN 5
+                ELSE 6
+            END,
+            MODEL_DOMAIN,
+            METRIC_KEY
+    """)
+
+
+def load_phase11a_domain_summary() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_MONITORING_DOMAIN_SUMMARY_V1
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+def load_phase11a_operational_summary() -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_MONITORING_OPERATIONAL_SUMMARY_V1
+    """)
+
+
+def load_phase11a_model_feedback(
+    simulation_id: str,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_MODEL_FEEDBACK_DETAIL_V1
+        WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+        ORDER BY MODEL_DOMAIN
+    """)
+
+
+def load_phase11a_cost_feedback(
+    simulation_id: str,
+) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML
+            .VW_KMAT_COST_FEEDBACK_DETAIL_V1
+        WHERE SIMULATION_ID = {sql_literal(simulation_id)}
+    """)
+
+
+def load_phase11a_runs(limit: int = 50) -> pd.DataFrame:
+    return query_df(f"""
+        SELECT *
+        FROM {DB_NAME}.CORE_ML.KMAT_MONITORING_RUN_V1
+        ORDER BY COMPLETED_AT DESC
+        LIMIT {int(limit)}
     """)
 
 
@@ -698,13 +1747,7 @@ def load_rfq_bmcs_status(limit: int = 200) -> pd.DataFrame:
             SOURCE_DOCUMENT_NAME,
             SOURCE_DOCUMENT_TYPE,
             SOURCE_DOCUMENT_TEXT,
-            ORIGINAL_DOCUMENT_TEXT,
-            PROCESSING_TEXT_EN,
-            RFQ_SUMMARY,
-            RFQ_COMPLEXITY_CATEGORY,
-            RFQ_COMPLEXITY_REASON,
             DOCUMENT_STATUS,
-
             SIMULATION_ID,
             CONFIGURATION_VERSION,
             EXTRACTED_CONFIGURATION_JSON,
@@ -714,17 +1757,10 @@ def load_rfq_bmcs_status(limit: int = 200) -> pd.DataFrame:
             COLOR,
             EXTRACTION_METHOD,
             EXTRACTION_MODEL_NAME,
-            CORTEX_EXTRACTION_REASONING,
-
-            RULE_BASED_BMCS_SCORE,
-            CORTEX_BMCS_SCORE,
             BOM_MATCH_CONFIDENCE_SCORE,
-            CORTEX_BMCS_REVIEW_STATUS,
             REVIEW_STATUS,
             REVIEW_REQUIRED_FLAG,
             FINAL_TRUSTED_COST_ALLOWED_FLAG,
-            FINAL_BMCS_METHOD,
-            CORTEX_BMCS_REASONING,
             BMCS_RISK_LEVEL,
             RULE_VALIDATION_STATUS,
             ASSESSMENT_METHOD,
@@ -735,6 +1771,7 @@ def load_rfq_bmcs_status(limit: int = 200) -> pd.DataFrame:
         ORDER BY RFQ_ID
         LIMIT {int(limit)}
     """)
+
 
 def load_rfq_scoring_detail(rfq_id: str) -> pd.DataFrame:
     return query_df(f"""
@@ -765,17 +1802,6 @@ def run_bmcs_scoring(rfq_id: str) -> Dict:
         return {"status": "UNKNOWN", "raw_result": str(raw_result)}
 
 
-def run_cortex_bmcs_assessment(rfq_id: str) -> Dict:
-    rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_BMCS_ASSESSMENT({sql_literal(rfq_id)})
-    """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
-
-
 def prepare_rfq_simulation_inputs(rfq_id: str) -> Dict:
     rows = run_sql(f"""
         CALL {DB_NAME}.CORE_INTERNAL.PREPARE_RFQ_SIMULATION_INPUTS({sql_literal(rfq_id)})
@@ -788,16 +1814,25 @@ def prepare_rfq_simulation_inputs(rfq_id: str) -> Dict:
 
 
 def run_rfq_cost_flow(rfq_id: str) -> Dict:
-    """
-    Phase 7B unified RFQ quote flow.
+    score_result = run_bmcs_scoring(rfq_id)
+    if score_result.get("status") != "SUCCESS":
+        return {"status": "ERROR", "stage": "BMCS_SCORING", "detail": score_result}
 
-    This calls the Snowflake wrapper that runs:
-    1. Hybrid Cortex BMCS
-    2. RFQ simulation preparation
-    3. Deterministic KMAT cost engine
-    4. Output summary patch with final hybrid BMCS trust status
-    """
-    return run_cortex_rfq_quote_pipeline(rfq_id)
+    prepare_result = prepare_rfq_simulation_inputs(rfq_id)
+    if prepare_result.get("status") != "SUCCESS":
+        return {"status": "ERROR", "stage": "PREPARE_RFQ_INPUTS", "detail": prepare_result}
+
+    simulation_id = prepare_result.get("simulation_id")
+    cost_result = run_kmat_engine(simulation_id)
+    return {
+        "status": cost_result.get("status", "UNKNOWN"),
+        "stage": "COMPLETE",
+        "rfq_id": rfq_id,
+        "simulation_id": simulation_id,
+        "bmcs_result": score_result,
+        "prepare_result": prepare_result,
+        "cost_result": cost_result,
+    }
 
 
 def get_bmcs_note_kind(review_status: str, final_allowed) -> str:
@@ -1142,322 +2177,6 @@ def load_bmcs_scoring_detail_for_rfq(rfq_id: str) -> pd.DataFrame:
         ORDER BY CHARACTERISTIC_NAME
     """)
 
-
-def run_cortex_css_explanation_assist(simulation_id: str) -> Dict:
-    rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_CSS_EXPLANATION_ASSIST({sql_literal(simulation_id)})
-    """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
-
-
-def load_cortex_css_explanation_assist(simulation_id: str) -> pd.DataFrame:
-    try:
-        return query_df(f"""
-            SELECT
-                SIMULATION_ID,
-                KMAT_ID,
-                CONFIGURATION,
-                OFFICIAL_CSS_SCORE,
-                OFFICIAL_SCRAP_RATE_APPLIED,
-                OFFICIAL_SCRAP_RISK_LEVEL,
-                CORTEX_SCRAP_RISK_BAND,
-                CORTEX_REASONING,
-                CORTEX_ENGINEERING_REVIEW_NOTE,
-                ASSIST_METHOD,
-                OFFICIAL_COST_OVERRIDE_FLAG,
-                ASSESSMENT_STATUS,
-                ASSESSMENT_NOTES,
-                UPDATED_AT
-            FROM {DB_NAME}.CORE_INPUT.VW_CORTEX_CSS_EXPLANATION_ASSIST
-            WHERE SIMULATION_ID = {sql_literal(simulation_id)}
-            ORDER BY UPDATED_AT DESC
-            LIMIT 1
-        """)
-    except Exception:
-        return pd.DataFrame()
-
-
-def upsert_commodity_market_note(
-    market_note_id: str,
-    commodity_group: str,
-    source_name: str,
-    note_title: str,
-    note_text: str,
-    target_forecast_month,
-):
-    market_note_id = normalize_id(market_note_id, "Market Note ID")
-    commodity_group = normalize_id(commodity_group, "Commodity Group")
-    month_str = str(target_forecast_month)
-
-    run_sql(f"""
-        MERGE INTO {DB_NAME}.CORE_INPUT.COMMODITY_MARKET_NOTES t
-        USING (
-            SELECT
-                {sql_literal(market_note_id)} AS MARKET_NOTE_ID,
-                {sql_literal(commodity_group)} AS COMMODITY_GROUP,
-                {sql_literal(source_name)} AS SOURCE_NAME,
-                {sql_literal(note_title)} AS NOTE_TITLE,
-                {sql_literal(note_text)} AS NOTE_TEXT,
-                TO_DATE({sql_literal(month_str)}) AS TARGET_FORECAST_MONTH,
-                'READY_FOR_CORTEX' AS NOTE_STATUS
-        ) s
-        ON t.MARKET_NOTE_ID = s.MARKET_NOTE_ID
-        WHEN MATCHED THEN UPDATE SET
-            t.COMMODITY_GROUP = s.COMMODITY_GROUP,
-            t.SOURCE_NAME = s.SOURCE_NAME,
-            t.NOTE_TITLE = s.NOTE_TITLE,
-            t.NOTE_TEXT = s.NOTE_TEXT,
-            t.TARGET_FORECAST_MONTH = s.TARGET_FORECAST_MONTH,
-            t.NOTE_STATUS = s.NOTE_STATUS,
-            t.ACTIVE_FLAG = TRUE,
-            t.UPDATED_AT = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN INSERT (
-            MARKET_NOTE_ID,
-            COMMODITY_GROUP,
-            SOURCE_NAME,
-            NOTE_TITLE,
-            NOTE_TEXT,
-            TARGET_FORECAST_MONTH,
-            NOTE_STATUS
-        )
-        VALUES (
-            s.MARKET_NOTE_ID,
-            s.COMMODITY_GROUP,
-            s.SOURCE_NAME,
-            s.NOTE_TITLE,
-            s.NOTE_TEXT,
-            s.TARGET_FORECAST_MONTH,
-            s.NOTE_STATUS
-        )
-    """)
-
-
-def run_cortex_fmis_signal_assist(market_note_id: str) -> Dict:
-    rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_FMIS_SIGNAL_ASSIST({sql_literal(market_note_id)})
-    """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
-
-
-def load_cortex_fmis_signal_assist(market_note_id: str = None, limit: int = 20) -> pd.DataFrame:
-    try:
-        where_clause = ""
-        if market_note_id:
-            where_clause = f"WHERE MARKET_NOTE_ID = {sql_literal(market_note_id)}"
-
-        return query_df(f"""
-            SELECT
-                MARKET_NOTE_ID,
-                SOURCE_NAME,
-                NOTE_TITLE,
-                INPUT_COMMODITY_GROUP,
-                TARGET_FORECAST_MONTH,
-                CORTEX_EXTRACTED_COMMODITY,
-                CORTEX_PRICE_DIRECTION,
-                CORTEX_RISK_LEVEL,
-                CORTEX_SIGNAL_TIME_HORIZON,
-                CORTEX_KEY_DRIVERS,
-                CORTEX_SUPPLIER_IMPACT,
-                CORTEX_MARKET_SUMMARY,
-                CORTEX_FMIS_EXPLANATION,
-                CORTEX_REVIEW_NOTE,
-                OFFICIAL_FMIS_OVERRIDE_FLAG,
-                ASSIST_METHOD,
-                ASSESSMENT_STATUS,
-                ASSESSMENT_NOTES,
-                UPDATED_AT
-            FROM {DB_NAME}.CORE_INPUT.VW_CORTEX_FMIS_SIGNAL_ASSIST
-            {where_clause}
-            ORDER BY UPDATED_AT DESC NULLS LAST
-            LIMIT {int(limit)}
-        """)
-    except Exception:
-        return pd.DataFrame()
-
-
-
-def upsert_tooling_maintenance_note(
-    maintenance_note_id: str,
-    simulation_id: str,
-    work_center_id: str,
-    source_name: str,
-    note_title: str,
-    note_text: str,
-):
-    maintenance_note_id = normalize_id(maintenance_note_id, "Maintenance Note ID")
-    simulation_id = normalize_id(simulation_id, "Simulation ID")
-    work_center_id = normalize_id(work_center_id, "Work Center ID")
-
-    run_sql(f"""
-        MERGE INTO {DB_NAME}.CORE_INPUT.TOOLING_MAINTENANCE_NOTES t
-        USING (
-            SELECT
-                {sql_literal(maintenance_note_id)} AS MAINTENANCE_NOTE_ID,
-                {sql_literal(simulation_id)} AS SIMULATION_ID,
-                {sql_literal(work_center_id)} AS WORK_CENTER_ID,
-                {sql_literal(source_name)} AS SOURCE_NAME,
-                {sql_literal(note_title)} AS NOTE_TITLE,
-                {sql_literal(note_text)} AS NOTE_TEXT,
-                'READY_FOR_CORTEX' AS NOTE_STATUS
-        ) s
-        ON t.MAINTENANCE_NOTE_ID = s.MAINTENANCE_NOTE_ID
-        WHEN MATCHED THEN UPDATE SET
-            t.SIMULATION_ID = s.SIMULATION_ID,
-            t.WORK_CENTER_ID = s.WORK_CENTER_ID,
-            t.SOURCE_NAME = s.SOURCE_NAME,
-            t.NOTE_TITLE = s.NOTE_TITLE,
-            t.NOTE_TEXT = s.NOTE_TEXT,
-            t.NOTE_STATUS = s.NOTE_STATUS,
-            t.ACTIVE_FLAG = TRUE,
-            t.UPDATED_AT = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN INSERT (
-            MAINTENANCE_NOTE_ID,
-            SIMULATION_ID,
-            WORK_CENTER_ID,
-            SOURCE_NAME,
-            NOTE_TITLE,
-            NOTE_TEXT,
-            NOTE_STATUS
-        )
-        VALUES (
-            s.MAINTENANCE_NOTE_ID,
-            s.SIMULATION_ID,
-            s.WORK_CENTER_ID,
-            s.SOURCE_NAME,
-            s.NOTE_TITLE,
-            s.NOTE_TEXT,
-            s.NOTE_STATUS
-        )
-    """)
-
-
-def run_cortex_tds_explanation_assist(simulation_id: str, maintenance_note_id: str = None) -> Dict:
-    note_sql = "NULL"
-    if maintenance_note_id and str(maintenance_note_id).strip():
-        note_sql = sql_literal(normalize_id(maintenance_note_id, "Maintenance Note ID"))
-
-    rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_TDS_EXPLANATION_ASSIST(
-            {sql_literal(simulation_id)},
-            {note_sql}
-        )
-    """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
-
-
-def load_cortex_tds_explanation_assist(
-    simulation_id: str = None,
-    maintenance_note_id: str = None,
-    limit: int = 20,
-) -> pd.DataFrame:
-    try:
-        filters = []
-        if simulation_id:
-            filters.append(f"SIMULATION_ID = {sql_literal(simulation_id)}")
-        if maintenance_note_id:
-            filters.append(f"MAINTENANCE_NOTE_ID = {sql_literal(maintenance_note_id)}")
-
-        where_clause = ""
-        if filters:
-            where_clause = "WHERE " + " AND ".join(filters)
-
-        return query_df(f"""
-            SELECT
-                SIMULATION_ID,
-                KMAT_ID,
-                MAINTENANCE_NOTE_ID,
-                CONFIGURATION,
-                OFFICIAL_MAX_TDS_FACTOR,
-                OFFICIAL_TOOLING_ADJUSTMENT_USD,
-                CORTEX_TOOLING_STRAIN_BAND,
-                CORTEX_EXTRACTED_WORK_CENTER,
-                CORTEX_EXTRACTED_STRAIN_SIGNAL,
-                CORTEX_EXTRACTED_SEVERITY,
-                CORTEX_EXTRACTED_RELATED_OPERATION,
-                CORTEX_EXTRACTED_IMPACT,
-                CORTEX_REASONING,
-                CORTEX_ENGINEERING_REVIEW_NOTE,
-                ASSIST_METHOD,
-                OFFICIAL_COST_OVERRIDE_FLAG,
-                ASSESSMENT_STATUS,
-                ASSESSMENT_NOTES,
-                UPDATED_AT
-            FROM {DB_NAME}.CORE_INPUT.VW_CORTEX_TDS_EXPLANATION_ASSIST
-            {where_clause}
-            ORDER BY UPDATED_AT DESC NULLS LAST
-            LIMIT {int(limit)}
-        """)
-    except Exception:
-        return pd.DataFrame()
-
-
-
-def run_cortex_cost_explanation(simulation_id: str) -> Dict:
-    rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_COST_EXPLANATION(
-            {sql_literal(simulation_id)}
-        )
-    """)
-    raw_result = rows[0][0] if rows else "{}"
-    try:
-        return json.loads(raw_result)
-    except Exception:
-        return {"status": "UNKNOWN", "raw_result": str(raw_result)}
-
-
-def load_cortex_cost_explanation_summary(simulation_id: str = None, limit: int = 20) -> pd.DataFrame:
-    try:
-        where_clause = ""
-        if simulation_id:
-            where_clause = f"WHERE SIMULATION_ID = {sql_literal(simulation_id)}"
-
-        return query_df(f"""
-            SELECT
-                SIMULATION_ID,
-                KMAT_ID,
-                RFQ_ID,
-                CONFIGURATION,
-                BASELINE_TOTAL_COST_USD,
-                RISK_ADJUSTED_TOTAL_COST_USD,
-                TOTAL_RISK_UPLIFT_USD,
-                TOTAL_RISK_UPLIFT_PCT,
-                CSS_SCORE,
-                SCRAP_RISK_LEVEL,
-                AVG_WEIGHTED_FMIS,
-                MAX_TDS_FACTOR,
-                BOM_MATCH_CONFIDENCE_SCORE,
-                BMCS_REVIEW_STATUS,
-                QUOTE_TRUST_STATUS,
-                EXECUTIVE_SUMMARY,
-                COST_DRIVER_EXPLANATION,
-                RISK_UPLIFT_EXPLANATION,
-                BMCS_TRUST_EXPLANATION,
-                ENGINEERING_REVIEW_NOTE,
-                ASSIST_METHOD,
-                OFFICIAL_COST_OVERRIDE_FLAG,
-                ASSESSMENT_STATUS,
-                ASSESSMENT_NOTES,
-                UPDATED_AT
-            FROM {DB_NAME}.CORE_INPUT.VW_CORTEX_COST_EXPLANATION_SUMMARY
-            {where_clause}
-            ORDER BY UPDATED_AT DESC NULLS LAST
-            LIMIT {int(limit)}
-        """)
-    except Exception:
-        return pd.DataFrame()
-
 # -----------------------------
 # Scenario presets
 # -----------------------------
@@ -1716,69 +2435,37 @@ def inject_custom_css():
         }
 
         .kpi-card {
-            box-sizing: border-box;
-            width: 100%;
-            height: 148px;
-            min-height: 148px;
-            max-height: 148px;
-            padding: 16px 16px 14px 16px;
-            border-radius: 20px;
+            padding: 18px 18px;
+            border-radius: 22px;
             border: 1px solid rgba(255,255,255,0.16);
             background:
                 linear-gradient(145deg, rgba(255,255,255,0.13), rgba(255,255,255,0.055)),
                 radial-gradient(circle at 94% 12%, var(--kpi-glow, rgba(99,230,255,0.18)), transparent 34%);
             box-shadow: 0 14px 38px rgba(0,0,0,0.24);
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            overflow: hidden;
-            margin: 0 0 14px 0;
+            min-height: 138px;
         }
 
         .kpi-label {
             color: var(--text-faint);
-            font-size: 0.72rem;
-            line-height: 1.1;
-            font-weight: 850;
-            letter-spacing: 0.075em;
+            font-size: 0.78rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            min-height: 16px;
         }
 
         .kpi-value {
             color: #ffffff;
-            font-size: clamp(1.08rem, 1.55vw, 1.46rem);
-            line-height: 1.08;
+            font-size: 1.8rem;
             font-weight: 900;
-            letter-spacing: -0.028em;
-            margin-top: 6px;
-            overflow: hidden;
+            letter-spacing: -0.035em;
+            margin-top: 8px;
             word-break: break-word;
-            overflow-wrap: anywhere;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            min-height: 34px;
         }
 
         .kpi-note {
             color: var(--text-soft);
-            font-size: 0.78rem;
-            line-height: 1.25;
+            font-size: 0.86rem;
             margin-top: 8px;
-            overflow: hidden;
-            overflow-wrap: anywhere;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            min-height: 36px;
-        }
-
-        [data-testid="column"] .kpi-card {
-            align-self: stretch;
         }
 
         .section-title {
@@ -1832,38 +2519,23 @@ def inject_custom_css():
         }
 
         .config-chip {
-            box-sizing: border-box;
-            height: 88px;
-            min-height: 88px;
             padding: 14px 16px;
             border-radius: 18px;
             border: 1px solid rgba(255,255,255,0.15);
             background: rgba(255,255,255,0.07);
-            overflow: hidden;
-            margin-bottom: 12px;
         }
         .config-chip .label {
             color: var(--text-faint);
-            font-size: 0.72rem;
-            line-height: 1.1;
+            font-size: 0.74rem;
             text-transform: uppercase;
             letter-spacing: 0.08em;
-            font-weight: 850;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            font-weight: 800;
         }
         .config-chip .value {
             color: #ffffff;
-            font-size: clamp(1.05rem, 1.35vw, 1.28rem);
-            line-height: 1.12;
+            font-size: 1.35rem;
             font-weight: 900;
-            margin-top: 7px;
-            overflow: hidden;
-            overflow-wrap: anywhere;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
+            margin-top: 5px;
         }
 
         div.stButton > button:first-child {
@@ -1898,15 +2570,6 @@ def inject_custom_css():
         .stTabs [aria-selected="true"] {
             color: #06101f !important;
             background: linear-gradient(135deg, var(--cyan), var(--green));
-        }
-
-        /* Uniform spacing for all KPI rows */
-        div[data-testid="column"] {
-            min-width: 0;
-        }
-
-        div[data-testid="column"] > div {
-            min-width: 0;
         }
 
         [data-testid="stDataFrame"] {
@@ -1985,6 +2648,378 @@ def inject_custom_css():
     )
 
 
+
+def inject_consistent_glass_overrides():
+    """Final visual-system pass only. Does not change app logic, SQL, or calculations."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
+        :root {
+            --ui-bg: #07111f;
+            --ui-panel: rgba(255,255,255,0.072);
+            --ui-panel-2: rgba(255,255,255,0.045);
+            --ui-border: rgba(255,255,255,0.118);
+            --ui-border-strong: rgba(125,211,252,0.24);
+            --ui-text: #edf6ff;
+            --ui-muted: rgba(237,246,255,0.66);
+            --ui-faint: rgba(237,246,255,0.48);
+            --ui-accent: #7dd3fc;
+            --ui-accent-2: #a78bfa;
+            --ui-success: #86efac;
+            --ui-warning: #fcd34d;
+            --ui-danger: #fb7185;
+        }
+
+        html, body, .stApp, [data-testid="stAppViewContainer"] {
+            font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+            color: var(--ui-text) !important;
+        }
+
+        .stApp, [data-testid="stAppViewContainer"] {
+            background:
+                radial-gradient(circle at 7% 9%, rgba(125,211,252,0.16) 0, transparent 30%),
+                radial-gradient(circle at 92% 8%, rgba(167,139,250,0.14) 0, transparent 28%),
+                radial-gradient(circle at 70% 95%, rgba(134,239,172,0.07) 0, transparent 32%),
+                linear-gradient(145deg, #06101e 0%, #0a1526 50%, #0f172a 100%) !important;
+        }
+
+        [data-testid="stHeader"] { background: transparent !important; }
+        #MainMenu, footer { visibility: hidden !important; }
+
+        .block-container {
+            max-width: 1480px !important;
+            padding-top: 1.35rem !important;
+            padding-bottom: 3rem !important;
+        }
+
+        /* Sidebar: formal, quiet, consistent */
+        section[data-testid="stSidebar"], [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, rgba(8,16,30,0.98), rgba(10,21,38,0.96)) !important;
+            border-right: 1px solid rgba(255,255,255,0.105) !important;
+            box-shadow: 16px 0 42px rgba(0,0,0,0.20) !important;
+        }
+        section[data-testid="stSidebar"] .block-container {
+            padding: 1.35rem 1rem 2rem 1rem !important;
+        }
+        section[data-testid="stSidebar"] h3,
+        section[data-testid="stSidebar"] h4,
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] span {
+            color: rgba(237,246,255,0.86) !important;
+        }
+
+        /* Hero: compact professional glass, not loud */
+        .glass-hero {
+            padding: 28px 32px !important;
+            border-radius: 24px !important;
+            border: 1px solid var(--ui-border) !important;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.095), rgba(255,255,255,0.042)),
+                radial-gradient(circle at 96% 12%, rgba(125,211,252,0.16), transparent 34%) !important;
+            box-shadow: 0 22px 58px rgba(0,0,0,0.30), inset 0 1px 0 rgba(255,255,255,0.10) !important;
+            backdrop-filter: blur(18px) !important;
+            margin-bottom: 1.35rem !important;
+        }
+        .glass-hero:after { opacity: 0.35 !important; }
+        .hero-eyebrow {
+            color: #dff7ff !important;
+            background: rgba(125,211,252,0.105) !important;
+            border: 1px solid rgba(125,211,252,0.22) !important;
+            border-radius: 999px !important;
+            padding: 7px 12px !important;
+            font-size: 0.74rem !important;
+            letter-spacing: 0.075em !important;
+        }
+        .hero-title {
+            color: #f8fbff !important;
+            font-size: clamp(2.05rem, 3.4vw, 3.35rem) !important;
+            line-height: 1.02 !important;
+            letter-spacing: -0.052em !important;
+            font-weight: 850 !important;
+        }
+        .hero-subtitle {
+            color: var(--ui-muted) !important;
+            font-size: 0.98rem !important;
+            max-width: 1020px !important;
+        }
+        .hero-pills { gap: 8px !important; margin-top: 16px !important; }
+        .pill {
+            background: rgba(255,255,255,0.055) !important;
+            border: 1px solid rgba(255,255,255,0.105) !important;
+            color: rgba(237,246,255,0.82) !important;
+            padding: 7px 11px !important;
+            font-size: 0.78rem !important;
+            font-weight: 650 !important;
+        }
+
+        /* Tabs: remove the odd rectangle; use clean glass pills */
+        .stTabs [data-baseweb="tab-list"],
+        div[data-baseweb="tab-list"] {
+            background: transparent !important;
+            border: 0 !important;
+            box-shadow: none !important;
+            padding: 0 2px 14px 2px !important;
+            margin: 0 0 12px 0 !important;
+            gap: 7px !important;
+            align-items: center !important;
+            overflow-x: auto !important;
+            scrollbar-width: thin !important;
+        }
+        .stTabs [data-baseweb="tab-list"]::before,
+        .stTabs [data-baseweb="tab-list"]::after,
+        div[data-baseweb="tab-list"]::before,
+        div[data-baseweb="tab-list"]::after {
+            display: none !important;
+            content: none !important;
+        }
+        .stTabs [data-baseweb="tab"],
+        button[data-baseweb="tab"] {
+            min-height: 38px !important;
+            height: 38px !important;
+            border-radius: 999px !important;
+            padding: 0 13px !important;
+            margin: 0 !important;
+            background: rgba(255,255,255,0.045) !important;
+            border: 1px solid rgba(255,255,255,0.095) !important;
+            color: rgba(237,246,255,0.70) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045) !important;
+            transition: background 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease !important;
+            white-space: nowrap !important;
+        }
+        .stTabs [data-baseweb="tab"]:hover,
+        button[data-baseweb="tab"]:hover {
+            color: rgba(248,251,255,0.92) !important;
+            background: rgba(255,255,255,0.070) !important;
+            border-color: rgba(125,211,252,0.20) !important;
+        }
+        .stTabs [data-baseweb="tab"] p,
+        button[data-baseweb="tab"] p {
+            color: inherit !important;
+            font-size: 0.88rem !important;
+            font-weight: 700 !important;
+            line-height: 1 !important;
+            margin: 0 !important;
+        }
+        .stTabs [aria-selected="true"],
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: #f8fbff !important;
+            background: linear-gradient(135deg, rgba(125,211,252,0.18), rgba(167,139,250,0.14)) !important;
+            border: 1px solid rgba(125,211,252,0.30) !important;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.11) !important;
+        }
+        .stTabs [data-baseweb="tab-highlight"],
+        .stTabs [data-baseweb="tab-border"],
+        div[data-baseweb="tab-highlight"],
+        div[data-baseweb="tab-border"] {
+            display: none !important;
+        }
+        div[data-baseweb="tab-panel"] { padding-top: 0.35rem !important; }
+
+        /* Section headings: less informal, tighter */
+        .section-title {
+            margin: 1.10rem 0 0.75rem 0 !important;
+            color: #f8fbff !important;
+            font-size: 1.18rem !important;
+            font-weight: 800 !important;
+            letter-spacing: -0.028em !important;
+            gap: 9px !important;
+        }
+        .section-title .dot {
+            width: 8px !important;
+            height: 8px !important;
+            background: linear-gradient(135deg, var(--ui-accent), var(--ui-accent-2)) !important;
+            box-shadow: 0 0 14px rgba(125,211,252,0.45) !important;
+        }
+        .tab-subtitle {
+            color: var(--ui-muted) !important;
+            font-size: 0.93rem !important;
+            margin: -0.2rem 0 1.05rem 0 !important;
+            line-height: 1.55 !important;
+        }
+
+        /* Consistent card system */
+        .glass-card,
+        .mini-card,
+        .rfq-callout,
+        [data-testid="stExpander"] {
+            border-radius: 18px !important;
+            border: 1px solid var(--ui-border) !important;
+            background: linear-gradient(180deg, var(--ui-panel), var(--ui-panel-2)) !important;
+            box-shadow: 0 14px 34px rgba(0,0,0,0.20), inset 0 1px 0 rgba(255,255,255,0.055) !important;
+            backdrop-filter: blur(14px) !important;
+        }
+        .glass-card { padding: 18px !important; margin-bottom: 0.95rem !important; }
+        .mini-card { min-height: 112px !important; padding: 15px !important; }
+        .rfq-callout { padding: 16px 18px !important; margin: 0.35rem 0 0.90rem 0 !important; }
+        .rfq-callout-title { font-size: 1.02rem !important; font-weight: 800 !important; }
+        .rfq-callout-text { color: var(--ui-muted) !important; font-size: 0.90rem !important; }
+
+        .kpi-card,
+        [data-testid="metric-container"] {
+            min-height: 126px !important;
+            border-radius: 18px !important;
+            border: 1px solid var(--ui-border) !important;
+            background:
+                linear-gradient(145deg, rgba(255,255,255,0.085), rgba(255,255,255,0.035)),
+                radial-gradient(circle at 96% 8%, var(--kpi-glow, rgba(125,211,252,0.10)), transparent 34%) !important;
+            box-shadow: 0 12px 30px rgba(0,0,0,0.20), inset 0 1px 0 rgba(255,255,255,0.07) !important;
+            padding: 16px !important;
+        }
+        .kpi-label,
+        [data-testid="metric-container"] label {
+            color: var(--ui-faint) !important;
+            font-size: 0.72rem !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.075em !important;
+            text-transform: uppercase !important;
+        }
+        .kpi-value,
+        [data-testid="stMetricValue"] {
+            color: #f8fbff !important;
+            font-family: 'JetBrains Mono', ui-monospace, monospace !important;
+            font-size: clamp(1.22rem, 1.65vw, 1.72rem) !important;
+            font-weight: 800 !important;
+            letter-spacing: -0.035em !important;
+            line-height: 1.18 !important;
+            word-break: break-word !important;
+            overflow-wrap: anywhere !important;
+        }
+        .kpi-note,
+        [data-testid="stMetricDelta"] {
+            color: var(--ui-muted) !important;
+            font-size: 0.80rem !important;
+            line-height: 1.35 !important;
+        }
+
+        .config-chip {
+            border-radius: 16px !important;
+            border: 1px solid var(--ui-border) !important;
+            background: rgba(255,255,255,0.046) !important;
+            padding: 13px 14px !important;
+            min-height: 92px !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045) !important;
+        }
+        .config-chip .label { color: var(--ui-faint) !important; font-size: 0.70rem !important; }
+        .config-chip .value { color: #f8fbff !important; font-size: 1.15rem !important; font-weight: 800 !important; }
+
+        /* Inputs/buttons: same visual language */
+        div.stButton > button,
+        .stButton > button {
+            min-height: 42px !important;
+            border-radius: 12px !important;
+            border: 1px solid rgba(125,211,252,0.22) !important;
+            background: linear-gradient(135deg, rgba(125,211,252,0.18), rgba(167,139,250,0.16)) !important;
+            color: #f8fbff !important;
+            font-weight: 800 !important;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.09) !important;
+        }
+        div.stButton > button:hover,
+        .stButton > button:hover {
+            transform: translateY(-1px) !important;
+            border-color: rgba(125,211,252,0.42) !important;
+            background: linear-gradient(135deg, rgba(125,211,252,0.25), rgba(167,139,250,0.22)) !important;
+        }
+        .stDownloadButton > button {
+            background: rgba(255,255,255,0.055) !important;
+            color: rgba(237,246,255,0.86) !important;
+            border-color: rgba(255,255,255,0.12) !important;
+        }
+
+        .stSelectbox > div > div,
+        .stTextInput > div > div > input,
+        .stNumberInput > div > div > input,
+        .stDateInput > div > div > input,
+        .stTextArea textarea,
+        div[data-baseweb="select"] > div {
+            border-radius: 12px !important;
+            background: rgba(255,255,255,0.045) !important;
+            border: 1px solid rgba(255,255,255,0.105) !important;
+            color: var(--ui-text) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035) !important;
+        }
+        label[data-testid="stWidgetLabel"] p {
+            color: rgba(237,246,255,0.78) !important;
+            font-weight: 700 !important;
+            font-size: 0.86rem !important;
+        }
+
+        /* Notes/alerts */
+        .soft-note,
+        .warning-note,
+        .success-note,
+        [data-testid="stAlert"] {
+            border-radius: 16px !important;
+            border: 1px solid var(--ui-border) !important;
+            background: rgba(255,255,255,0.050) !important;
+            color: rgba(237,246,255,0.86) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045) !important;
+        }
+        .success-note { border-color: rgba(134,239,172,0.22) !important; background: rgba(134,239,172,0.055) !important; }
+        .warning-note { border-color: rgba(252,211,77,0.22) !important; background: rgba(252,211,77,0.055) !important; }
+
+        /* Tables/charts */
+        [data-testid="stDataFrame"],
+        .stDataFrame,
+        .stBarChart,
+        .stLineChart {
+            border-radius: 16px !important;
+            border: 1px solid var(--ui-border) !important;
+            background: rgba(255,255,255,0.035) !important;
+            box-shadow: 0 12px 28px rgba(0,0,0,0.16) !important;
+            overflow: hidden !important;
+        }
+        [data-testid="stDataFrame"] th,
+        [data-testid="stDataFrame"] thead tr th {
+            background: rgba(255,255,255,0.055) !important;
+            color: rgba(237,246,255,0.68) !important;
+            font-size: 0.72rem !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.055em !important;
+            text-transform: uppercase !important;
+        }
+
+        /* Expander formalization */
+        [data-testid="stExpander"] details summary,
+        .streamlit-expanderHeader {
+            color: rgba(237,246,255,0.86) !important;
+            font-weight: 750 !important;
+            background: transparent !important;
+        }
+        [data-testid="stFileUploader"] {
+            border-radius: 16px !important;
+            border: 1px dashed rgba(125,211,252,0.26) !important;
+            background: rgba(125,211,252,0.035) !important;
+            padding: 10px !important;
+        }
+        [data-testid="stFileUploader"] section {
+            border-radius: 14px !important;
+            border-color: rgba(255,255,255,0.13) !important;
+            background: rgba(255,255,255,0.035) !important;
+        }
+
+        h1, h2, h3, h4 { color: #f8fbff !important; letter-spacing: -0.03em !important; }
+        p, li { color: rgba(237,246,255,0.78) !important; }
+        hr { border-color: rgba(255,255,255,0.10) !important; }
+
+        ::-webkit-scrollbar { width: 7px; height: 7px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 999px; }
+
+        @media (max-width: 1200px) {
+            .stTabs [data-baseweb="tab"] p,
+            button[data-baseweb="tab"] p { font-size: 0.82rem !important; }
+            .stTabs [data-baseweb="tab"],
+            button[data-baseweb="tab"] { padding: 0 10px !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def soft_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -2019,22 +3054,12 @@ def note(text: str, kind: str = "soft"):
 
 
 def kpi_card(label: str, value: str, note_text: str = "", glow: str = "rgba(99,230,255,0.18)"):
-    """
-    Uniform KPI card used everywhere in the app.
-
-    The CSS clamps long values/notes so Configure & Run, Scenario History,
-    Compare Scenarios, Component Impact, RFQ/BMCS, and Cortex RFQ Intake
-    all keep the same card height and spacing.
-    """
-    label_html = safe_html(label)
-    value_html = safe_html(value)
-    note_html = safe_html(note_text)
     st.markdown(
         f"""
         <div class="kpi-card" style="--kpi-glow: {glow};">
-            <div class="kpi-label" title="{label_html}">{label_html}</div>
-            <div class="kpi-value" title="{value_html}">{value_html}</div>
-            <div class="kpi-note" title="{note_html}">{note_html}</div>
+            <div class="kpi-label">{safe_html(label)}</div>
+            <div class="kpi-value">{safe_html(value)}</div>
+            <div class="kpi-note">{safe_html(note_text)}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2058,11 +3083,12 @@ def render_hero():
         """
         <div class="glass-hero">
             <div class="hero-eyebrow">🚚 KMAT Cost Intelligence</div>
-            <h1 class="hero-title">KMAT Configuration Cost Command Center</h1>
+            <h1 class="hero-title">Truck Configuration Cost Command Center</h1>
             <div class="hero-subtitle">
                 A polished Snowflake + Streamlit workspace for Cortex RFQ intake and configurable truck costing.
-                Upload customer RFQs, extract KMAT characteristics, validate BMCS trust, run the Snowpark engine,
-                compare scenarios, and explain baseline plus risk-adjusted cost with confidence.
+                Upload customer RFQs, extract KMAT characteristics, validate BMCS trust, run the governed Snowpark engine,
+                compare rule, ML, override, default, and final decisions, and explain baseline plus risk-adjusted cost with confidence.
+                Runtime candidate use is governed by policy fingerprints, kill switches, secure procedures, and deterministic fallback.
             </div>
             <div class="hero-pills">
                 <span class="pill">JSON Rule Evaluation</span>
@@ -2073,6 +3099,11 @@ def render_hero():
                 <span class="pill">CSS + FMIS + TDS Risk Layer</span>
                 <span class="pill">Cortex RFQ Upload</span>
                 <span class="pill">RFQ/BMCS Trust Gate</span>
+                <span class="pill">Governed Decision Hierarchy</span>
+                <span class="pill">Secure Runtime Boundary</span>
+                <span class="pill">Policy Fingerprints + Seals</span>
+                <span class="pill">Least-Privilege Procedures</span>
+                <span class="pill">Shadow ML Advisory</span>
             </div>
         </div>
         """,
@@ -2092,7 +3123,7 @@ def format_table_money(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # ============================================================
 
 st.set_page_config(
-    page_title="KMAT Truck Cost Command Center",
+    page_title="KMAT Governed Cost Command Center",
     page_icon="🚚",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -2309,237 +3340,38 @@ footer { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 inject_custom_css()
-
-# UI-only polish overrides: consistent KPI/card sizing and cleaner RFQ/Risk layout.
-# No backend logic, SQL calls, procedure names, or calculations are changed here.
-st.markdown("""
-<style>
-/* ============================================================
-   Phase 7C UI polish override - layout only
-   ============================================================ */
-
-/* Global spacing hygiene */
-.block-container {
-    padding-top: 1.15rem !important;
-    padding-left: 2.2rem !important;
-    padding-right: 2.2rem !important;
-}
-
-[data-testid="stVerticalBlock"] {
-    gap: 0.72rem !important;
-}
-
-[data-testid="column"] {
-    padding-left: 0.28rem !important;
-    padding-right: 0.28rem !important;
-}
-
-/* Consistent custom KPI cards */
-.kpi-card {
-    height: 150px !important;
-    min-height: 150px !important;
-    max-height: 150px !important;
-    padding: 16px 16px !important;
-    border-radius: 20px !important;
-    display: flex !important;
-    flex-direction: column !important;
-    justify-content: flex-start !important;
-    overflow: hidden !important;
-    box-sizing: border-box !important;
-}
-
-.kpi-label {
-    font-size: 0.70rem !important;
-    line-height: 1.15 !important;
-    letter-spacing: 0.075em !important;
-    min-height: 16px !important;
-    max-height: 18px !important;
-    overflow: hidden !important;
-    white-space: nowrap !important;
-    text-overflow: ellipsis !important;
-}
-
-.kpi-value {
-    font-size: clamp(1.08rem, 1.42vw, 1.48rem) !important;
-    line-height: 1.08 !important;
-    letter-spacing: -0.025em !important;
-    margin-top: 7px !important;
-    min-height: 42px !important;
-    max-height: 48px !important;
-    overflow: hidden !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-    display: -webkit-box !important;
-    -webkit-line-clamp: 2 !important;
-    -webkit-box-orient: vertical !important;
-}
-
-.kpi-note {
-    font-size: 0.76rem !important;
-    line-height: 1.24 !important;
-    margin-top: 8px !important;
-    min-height: 36px !important;
-    max-height: 38px !important;
-    overflow: hidden !important;
-    overflow-wrap: anywhere !important;
-    display: -webkit-box !important;
-    -webkit-line-clamp: 2 !important;
-    -webkit-box-orient: vertical !important;
-}
-
-/* Streamlit native metric cards, used in a few existing areas */
-[data-testid="metric-container"] {
-    height: 126px !important;
-    min-height: 126px !important;
-    max-height: 126px !important;
-    padding: 16px 18px !important;
-    overflow: hidden !important;
-    box-sizing: border-box !important;
-}
-
-[data-testid="metric-container"] label {
-    font-size: 0.68rem !important;
-    line-height: 1.1 !important;
-    max-width: 100% !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-    white-space: nowrap !important;
-}
-
-[data-testid="stMetricValue"] {
-    font-size: clamp(1.04rem, 1.35vw, 1.42rem) !important;
-    line-height: 1.12 !important;
-    overflow-wrap: anywhere !important;
-    word-break: break-word !important;
-}
-
-[data-testid="stMetricDelta"] {
-    font-size: 0.72rem !important;
-    line-height: 1.15 !important;
-}
-
-/* Standardized config chips */
-.config-chip {
-    height: 88px !important;
-    min-height: 88px !important;
-    max-height: 88px !important;
-    padding: 13px 15px !important;
-    border-radius: 17px !important;
-    overflow: hidden !important;
-    box-sizing: border-box !important;
-}
-
-.config-chip .label {
-    font-size: 0.68rem !important;
-    line-height: 1.1 !important;
-    white-space: nowrap !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-}
-
-.config-chip .value {
-    font-size: clamp(1.05rem, 1.22vw, 1.28rem) !important;
-    line-height: 1.1 !important;
-    margin-top: 7px !important;
-    overflow: hidden !important;
-    overflow-wrap: anywhere !important;
-    display: -webkit-box !important;
-    -webkit-line-clamp: 2 !important;
-    -webkit-box-orient: vertical !important;
-}
-
-/* Cleaner notes and sections */
-.section-title {
-    font-size: 1.26rem !important;
-    margin: 0.82rem 0 0.58rem 0 !important;
-    gap: 8px !important;
-}
-
-.section-title .dot {
-    width: 10px !important;
-    height: 10px !important;
-}
-
-.tab-subtitle {
-    font-size: 0.91rem !important;
-    line-height: 1.48 !important;
-    margin-bottom: 0.72rem !important;
-}
-
-.soft-note,
-.warning-note,
-.success-note {
-    padding: 12px 14px !important;
-    border-radius: 16px !important;
-    font-size: 0.88rem !important;
-    line-height: 1.42 !important;
-    margin-bottom: 0.50rem !important;
-}
-
-/* Dataframes/tables: less visual bulk */
-[data-testid="stDataFrame"] {
-    border-radius: 14px !important;
-    margin-top: 0.28rem !important;
-    margin-bottom: 0.72rem !important;
-}
-
-[data-testid="stDataFrame"] div[role="gridcell"],
-[data-testid="stDataFrame"] div[role="columnheader"] {
-    font-size: 0.80rem !important;
-}
-
-/* Expander and tabs spacing */
-[data-testid="stExpander"] {
-    margin-top: 0.45rem !important;
-    margin-bottom: 0.60rem !important;
-}
-
-.stTabs [data-baseweb="tab-list"] {
-    gap: 6px !important;
-    padding: 7px !important;
-    margin-bottom: 0.75rem !important;
-}
-
-.stTabs [data-baseweb="tab"] {
-    height: 40px !important;
-    padding: 8px 14px !important;
-    font-size: 0.84rem !important;
-}
-
-/* RFQ/Risk heavy text areas and JSON blocks should not dominate the page */
-textarea {
-    font-size: 0.86rem !important;
-    line-height: 1.38 !important;
-}
-
-[data-testid="stJson"] {
-    font-size: 0.80rem !important;
-}
-
-/* File uploaders and inputs are compact but readable */
-[data-testid="stFileUploader"] {
-    padding: 10px !important;
-    border-radius: 16px !important;
-}
-
-.stTextInput input,
-.stTextArea textarea,
-.stSelectbox div[data-baseweb="select"] {
-    font-size: 0.88rem !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
+inject_consistent_glass_overrides()
 initialize_widget_state()
 allowed_values = load_allowed_values_cached()
 render_hero()
 
+try:
+    session_identity = load_session_identity()
+except Exception as identity_exc:
+    session_identity = {
+        "ACTUAL_USER": "UNAVAILABLE",
+        "ACTIVE_ROLE": "UNAVAILABLE",
+        "ACTIVE_WAREHOUSE": "UNAVAILABLE",
+        "IDENTITY_ERROR": str(identity_exc),
+    }
+
+actual_snowflake_user = optional_text(
+    session_identity.get("ACTUAL_USER"),
+    "UNAVAILABLE",
+)
+active_snowflake_role = optional_text(
+    session_identity.get("ACTIVE_ROLE"),
+    "UNAVAILABLE",
+)
+
 with st.expander("About this dashboard", expanded=False):
     st.write(
         """
-       - Upload or paste an RFQ and use Cortex to extract KMAT configuration values such as ENGINE, CAB, WHEEL, and COLOR.
+- Upload or paste an RFQ and use Cortex to extract KMAT configuration values such as ENGINE, CAB, WHEEL, and COLOR.
 - Review BMCS confidence, risk-adjusted costing, and trusted-cost eligibility before running the final KMAT cost simulation.
-- Compare deterministic baseline cost with CSS, FMIS, and TDS risk-adjusted cost for better quotation decisions.
+- Compare deterministic rules, ML advisory values, approved shadow overrides, safe defaults, and final governed values.
+- Inspect policy/model lineage, safety gates, runtime kill switches, policy fingerprints, policy seals, and audit events.
+- The dashboard contains no deployment-activation or runtime-enablement action; those remain separate governed administrative operations.
         """
     )
 
@@ -2550,6 +3382,25 @@ with st.expander("About this dashboard", expanded=False):
 with st.sidebar:
     st.markdown("### ⚙️ Configuration Studio")
     st.caption("Choose a preset or manually configure the KMAT truck.")
+
+    with st.expander("🔐 Snowflake Security Context", expanded=False):
+        st.text_input(
+            "Actual Snowflake user",
+            value=actual_snowflake_user,
+            disabled=True,
+            key="sidebar_actual_snowflake_user",
+        )
+        st.text_input(
+            "Active Snowflake role",
+            value=active_snowflake_role,
+            disabled=True,
+            key="sidebar_active_snowflake_role",
+        )
+        st.caption(
+            "Secure procedures capture CURRENT_USER() inside "
+            "Snowflake. Owner and executor roles must never be "
+            "assigned to normal application users."
+        )
 
     selected_preset = st.selectbox("Scenario Preset", list(PRESETS.keys()))
     col_preset_1, col_preset_2 = st.columns(2)
@@ -2607,10 +3458,12 @@ main_tabs = st.tabs([
     "🧾 RFQ/BMCS Review",
     "✨ Configure & Run",
     "🛡️ Risk Layer",
+    "🧭 Governed Decisions",
     "📜 Scenario History",
     "📊 Compare Scenarios",
     "🔍 Component Impact",
     "🚀 Batch Demo Runner",
+    "📈 Monitoring & Outcomes",
 ])
 # -----------------------------
 # Tab 3: Configure & Run
@@ -2618,7 +3471,7 @@ main_tabs = st.tabs([
 
 with main_tabs[2]:
     section("Build Configuration", "🧩")
-    st.markdown('<div class="tab-subtitle">Select a truck variant and run the Snowpark cost engine. The results below are written back to Snowflake output tables.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tab-subtitle">Select a truck variant and run the deterministic governed Snowpark cost flow. Runtime model activation is a separate administrative process and is not exposed by this dashboard.</div>', unsafe_allow_html=True)
 
     config_cols = st.columns(4)
     with config_cols[0]:
@@ -2645,7 +3498,7 @@ with main_tabs[2]:
     with run_col_1:
         run_button = st.button("Run Simulation", type="primary", use_container_width=True)
     with run_col_2:
-        note("This action writes the selected configuration to CORE_INPUT, calls RUN_KMAT_COST_SIMULATION, and refreshes the output cards/tables from CORE_OUTPUT.", "soft")
+        note("This action writes the selected configuration to CORE_INPUT, runs the deterministic governed cost procedure, refreshes CORE_OUTPUT, and records the governed decision hierarchy. It does not activate or enable a model.", "soft")
 
     if run_button:
         try:
@@ -2675,7 +3528,16 @@ with main_tabs[2]:
             st.session_state["last_procedure_result"] = procedure_result
 
             if procedure_result.get("status") == "SUCCESS":
-                note(f"Simulation {simulation_id} completed successfully. Results are now available in CORE_OUTPUT.", "success")
+                phase10b_result = procedure_result.get(
+                    "phase10b_result",
+                    {},
+                )
+                note(
+                    f"Simulation {simulation_id} completed successfully. "
+                    f"Hierarchy status: "
+                    f"{phase10b_result.get('resolution_status', 'N/A')}.",
+                    "success",
+                )
             else:
                 note("Stored procedure did not return SUCCESS. Open the Procedure JSON tab for details.", "warning")
                 st.json(procedure_result)
@@ -2886,7 +3748,7 @@ with main_tabs[3]:
             with adj_cols[3]:
                 kpi_card("Overhead Uplift", money(row.get("OVERHEAD_ADJUSTMENT_USD", 0)), "Recalculated overhead", "rgba(255,209,102,0.18)")
 
-            risk_tabs = st.tabs(["🧱 Component Risk", "🏭 Operation TDS", "🧾 Overhead Risk", "🧠 CSS Assist", "🌐 FMIS Assist", "⚙️ TDS Assist", "📑 Cost Summary", "📝 Notes"])
+            risk_tabs = st.tabs(["🧱 Component Risk", "🏭 Operation TDS", "🧾 Overhead Risk", "📝 Notes"])
             with risk_tabs[0]:
                 cols = [
                     "COMPONENT_ID", "COMPONENT_DESCRIPTION", "IS_BULK_MATERIAL", "COST_MISSING_FLAG",
@@ -2918,599 +3780,1069 @@ with main_tabs[3]:
                     "RATE_VALUE", "BASE_OVERHEAD_COST_USD", "ADJUSTED_OVERHEAD_COST_USD", "OVERHEAD_ADJUSTMENT_USD"
                 ]), use_container_width=True, hide_index=True)
             with risk_tabs[3]:
-                st.markdown("#### Cortex CSS Explanation Assist")
-                note(
-                    "Advisory only: Cortex explains the official deterministic CSS result. It does not override CSS, scrap rate, or risk-adjusted cost.",
-                    "soft",
-                )
-
-                css_action_cols = st.columns([1, 2])
-                with css_action_cols[0]:
-                    run_css_assist_clicked = st.button(
-                        "Generate CSS Explanation",
-                        use_container_width=True,
-                        key=f"btn_css_assist_{risk_sim_id}",
-                    )
-                with css_action_cols[1]:
-                    st.caption("Runs CORE_INTERNAL.RUN_CORTEX_CSS_EXPLANATION_ASSIST for the selected simulation.")
-
-                if run_css_assist_clicked:
-                    try:
-                        with st.spinner("Generating advisory CSS explanation with Cortex..."):
-                            css_result = run_cortex_css_explanation_assist(risk_sim_id)
-
-                        st.session_state["last_css_assist_result"] = css_result
-
-                        if css_result.get("status") == "SUCCESS":
-                            note("Cortex CSS explanation generated successfully.", "success")
-                        else:
-                            note("Cortex CSS explanation did not return SUCCESS.", "warning")
-
-                        st.json(css_result)
-
-                    except Exception as exc:
-                        st.error(f"Cortex CSS explanation failed: {exc}")
-
-                css_assist_df = load_cortex_css_explanation_assist(risk_sim_id)
-
-                if css_assist_df.empty:
-                    note("No Cortex CSS explanation found yet for this simulation. Click Generate CSS Explanation.", "soft")
-                else:
-                    css_row = css_assist_df.iloc[0]
-
-                    css_cols = st.columns(4)
-                    with css_cols[0]:
-                        kpi_card(
-                            "Official CSS",
-                            f"{as_float(css_row.get('OFFICIAL_CSS_SCORE', 0)):.0f}",
-                            str(css_row.get("OFFICIAL_SCRAP_RISK_LEVEL", "N/A")),
-                            "rgba(255,143,171,0.20)",
-                        )
-                    with css_cols[1]:
-                        kpi_card(
-                            "Official Scrap Rate",
-                            f"{as_float(css_row.get('OFFICIAL_SCRAP_RATE_APPLIED', 0))*100:.2f}%",
-                            "Deterministic cost engine",
-                            "rgba(255,209,102,0.20)",
-                        )
-                    with css_cols[2]:
-                        kpi_card(
-                            "Cortex Band",
-                            str(css_row.get("CORTEX_SCRAP_RISK_BAND", "N/A")),
-                            "Advisory classification",
-                            "rgba(177,151,252,0.20)",
-                        )
-                    with css_cols[3]:
-                        override_flag = bool(css_row.get("OFFICIAL_COST_OVERRIDE_FLAG", False))
-                        kpi_card(
-                            "Cost Override",
-                            "YES" if override_flag else "NO",
-                            str(css_row.get("ASSIST_METHOD", "N/A")),
-                            "rgba(126,247,196,0.18)",
-                        )
-
-                    st.markdown("#### Cortex Reasoning")
-                    st.write(css_row.get("CORTEX_REASONING", ""))
-
-                    st.markdown("#### Engineering Review Note")
-                    st.write(css_row.get("CORTEX_ENGINEERING_REVIEW_NOTE", ""))
-
-                    st.dataframe(css_assist_df, use_container_width=True, hide_index=True)
-
-            with risk_tabs[4]:
-                st.markdown("#### Cortex FMIS Signal + Explanation Assist")
-                note(
-                    "Advisory only: Cortex reads supplier or market notes and explains commodity signals. It does not override official FMIS, material index forecasts, or material cost.",
-                    "soft",
-                )
-
-                st.session_state.setdefault("fmis_market_note_id", f"NOTE_UI_{utc_stamp()}")
-
-                fmis_top_cols = st.columns(4)
-                with fmis_top_cols[0]:
-                    kpi_card(
-                        "Official Avg FMIS",
-                        f"{as_float(row.get('AVG_WEIGHTED_FMIS', 1)):.4f}x",
-                        "From current cost engine",
-                        "rgba(99,230,255,0.22)",
-                    )
-                with fmis_top_cols[1]:
-                    kpi_card(
-                        "Commodity Uplift",
-                        money(row.get("COMMODITY_ADJUSTMENT_USD", 0)),
-                        "Official material impact",
-                        "rgba(255,209,102,0.20)",
-                    )
-                with fmis_top_cols[2]:
-                    kpi_card(
-                        "Official Source",
-                        "FMIS Table",
-                        "MATERIAL_INDEX_FORECASTS",
-                        "rgba(126,247,196,0.18)",
-                    )
-                with fmis_top_cols[3]:
-                    kpi_card(
-                        "Override",
-                        "NO",
-                        "Assist layer only",
-                        "rgba(177,151,252,0.20)",
-                    )
-
-                fmis_form_cols = st.columns([1, 1])
-                with fmis_form_cols[0]:
-                    market_note_id = st.text_input(
-                        "Market Note ID",
-                        key="fmis_market_note_id",
-                    )
-                    commodity_group = st.selectbox(
-                        "Commodity Group",
-                        ["STEEL", "ALUMINUM", "RUBBER", "CHEMICALS", "OTHER"],
-                        key="fmis_commodity_group",
-                    )
-                    target_forecast_month = st.date_input(
-                        "Target Forecast Month",
-                        value=date(2026, 9, 1),
-                        key="fmis_target_forecast_month",
-                    )
-                with fmis_form_cols[1]:
-                    source_name = st.text_input(
-                        "Source Name",
-                        value="Supplier Market Update",
-                        key="fmis_source_name",
-                    )
-                    note_title = st.text_input(
-                        "Note Title",
-                        value="Commodity market signal for planned production",
-                        key="fmis_note_title",
-                    )
-
-                note_text = st.text_area(
-                    "Supplier / Market Note",
-                    height=150,
-                    placeholder="Example: Steel suppliers are warning of upward price pressure next quarter due to higher energy costs and port delays.",
-                    key="fmis_note_text",
-                )
-
-                fmis_action_cols = st.columns([1, 2])
-                with fmis_action_cols[0]:
-                    run_fmis_clicked = st.button(
-                        "Save + Run FMIS Assist",
-                        use_container_width=True,
-                        key=f"btn_fmis_assist_{risk_sim_id}",
-                    )
-                with fmis_action_cols[1]:
-                    st.caption("Runs CORE_INTERNAL.RUN_CORTEX_FMIS_SIGNAL_ASSIST for the market note. Official FMIS remains unchanged.")
-
-                if run_fmis_clicked:
-                    try:
-                        normalized_note_id = normalize_id(market_note_id, "Market Note ID")
-                        if not note_text.strip():
-                            raise ValueError("Please enter supplier or market note text before running FMIS Assist.")
-
-                        with st.spinner("Saving market note and running Cortex FMIS Signal Assist..."):
-                            upsert_commodity_market_note(
-                                market_note_id=normalized_note_id,
-                                commodity_group=commodity_group,
-                                source_name=source_name,
-                                note_title=note_title,
-                                note_text=note_text.strip(),
-                                target_forecast_month=target_forecast_month,
-                            )
-                            fmis_result = run_cortex_fmis_signal_assist(normalized_note_id)
-
-                        st.session_state["last_fmis_market_note_id"] = normalized_note_id
-                        st.session_state["last_fmis_assist_result"] = fmis_result
-
-                        if fmis_result.get("status") == "SUCCESS":
-                            note("Cortex FMIS signal assist completed successfully.", "success")
-                        else:
-                            note("Cortex FMIS signal assist did not return SUCCESS.", "warning")
-
-                        st.json(fmis_result)
-
-                    except Exception as exc:
-                        st.error(f"Cortex FMIS signal assist failed: {exc}")
-
-                selected_market_note_id = st.session_state.get("last_fmis_market_note_id", market_note_id)
-                fmis_assist_df = load_cortex_fmis_signal_assist(selected_market_note_id, limit=1)
-
-                if fmis_assist_df.empty:
-                    note("No Cortex FMIS signal result found yet. Save and run FMIS Assist to generate one.", "soft")
-                else:
-                    fmis_row = fmis_assist_df.iloc[0]
-
-                    signal_cols = st.columns(4)
-                    with signal_cols[0]:
-                        kpi_card(
-                            "Extracted Commodity",
-                            str(fmis_row.get("CORTEX_EXTRACTED_COMMODITY", "N/A")),
-                            f"Input: {fmis_row.get('INPUT_COMMODITY_GROUP', 'N/A')}",
-                            "rgba(99,230,255,0.22)",
-                        )
-                    with signal_cols[1]:
-                        kpi_card(
-                            "Price Direction",
-                            str(fmis_row.get("CORTEX_PRICE_DIRECTION", "N/A")),
-                            str(fmis_row.get("CORTEX_SIGNAL_TIME_HORIZON", "")),
-                            "rgba(255,209,102,0.20)",
-                        )
-                    with signal_cols[2]:
-                        kpi_card(
-                            "Risk Level",
-                            str(fmis_row.get("CORTEX_RISK_LEVEL", "N/A")),
-                            str(fmis_row.get("CORTEX_KEY_DRIVERS", "")),
-                            "rgba(255,143,171,0.20)",
-                        )
-                    with signal_cols[3]:
-                        override_flag = bool(fmis_row.get("OFFICIAL_FMIS_OVERRIDE_FLAG", False))
-                        kpi_card(
-                            "FMIS Override",
-                            "YES" if override_flag else "NO",
-                            str(fmis_row.get("ASSIST_METHOD", "N/A")),
-                            "rgba(126,247,196,0.18)",
-                        )
-
-                    st.markdown("#### Market Summary")
-                    st.write(fmis_row.get("CORTEX_MARKET_SUMMARY", ""))
-
-                    st.markdown("#### FMIS Explanation")
-                    st.write(fmis_row.get("CORTEX_FMIS_EXPLANATION", ""))
-
-                    st.markdown("#### Review Note")
-                    st.write(fmis_row.get("CORTEX_REVIEW_NOTE", ""))
-
-                    st.dataframe(fmis_assist_df, use_container_width=True, hide_index=True)
-
-                recent_fmis_df = load_cortex_fmis_signal_assist(limit=10)
-                if not recent_fmis_df.empty:
-                    st.markdown("#### Recent FMIS Signal Assist Results")
-                    st.dataframe(recent_fmis_df, use_container_width=True, hide_index=True)
-
-            with risk_tabs[5]:
-                st.markdown("#### Cortex TDS Explanation Assist")
-                note(
-                    "Advisory only: Cortex explains tooling strain and maintenance signals. It does not override official TDS, operation TDS rules, or machine cost.",
-                    "soft",
-                )
-
-                tds_top_cols = st.columns(4)
-                with tds_top_cols[0]:
-                    kpi_card(
-                        "Official Max TDS",
-                        f"{as_float(row.get('MAX_TDS_FACTOR', 1)):.2f}x",
-                        "From current cost engine",
-                        "rgba(177,151,252,0.22)",
-                    )
-                with tds_top_cols[1]:
-                    kpi_card(
-                        "Tooling Uplift",
-                        money(row.get("TOOLING_ADJUSTMENT_USD", 0)),
-                        "Official machine impact",
-                        "rgba(255,209,102,0.20)",
-                    )
-                with tds_top_cols[2]:
-                    kpi_card(
-                        "Official Source",
-                        "TDS Rules",
-                        "OPERATION_TDS_RULES",
-                        "rgba(126,247,196,0.18)",
-                    )
-                with tds_top_cols[3]:
-                    kpi_card(
-                        "Override",
-                        "NO",
-                        "Assist layer only",
-                        "rgba(99,230,255,0.22)",
-                    )
-
-                st.session_state.setdefault("tds_maintenance_note_id", f"NOTE_TDS_UI_{utc_stamp()}")
-
-                work_center_options = []
-                if not operations_df.empty and "WORK_CENTER_ID" in operations_df.columns:
-                    work_center_options = sorted([str(x) for x in operations_df["WORK_CENTER_ID"].dropna().unique().tolist()])
-                if not work_center_options:
-                    work_center_options = ["WC_ASSEMBLY", "WC_PAINT", "WC_QA"]
-
-                tds_form_cols = st.columns([1, 1])
-                with tds_form_cols[0]:
-                    maintenance_note_id = st.text_input(
-                        "Maintenance Note ID",
-                        key="tds_maintenance_note_id",
-                    )
-                    work_center_id = st.selectbox(
-                        "Work Center",
-                        work_center_options,
-                        key="tds_work_center_id",
-                    )
-                with tds_form_cols[1]:
-                    tds_source_name = st.text_input(
-                        "Source Name",
-                        value="Maintenance Log",
-                        key="tds_source_name",
-                    )
-                    tds_note_title = st.text_input(
-                        "Note Title",
-                        value="Tooling strain observation for selected simulation",
-                        key="tds_note_title",
-                    )
-
-                tds_note_text = st.text_area(
-                    "Maintenance / Tooling Note",
-                    height=150,
-                    placeholder="Example: Assembly fixture showed abnormal vibration during V8 offroad builds. Maintenance observed faster fixture wear after premium cab and offroad wheel batches.",
-                    key="tds_note_text",
-                )
-
-                tds_action_cols = st.columns([1, 1, 2])
-                with tds_action_cols[0]:
-                    run_tds_with_note_clicked = st.button(
-                        "Save + Run TDS Assist",
-                        use_container_width=True,
-                        key=f"btn_tds_assist_note_{risk_sim_id}",
-                    )
-                with tds_action_cols[1]:
-                    run_tds_without_note_clicked = st.button(
-                        "Run Without Note",
-                        use_container_width=True,
-                        key=f"btn_tds_assist_no_note_{risk_sim_id}",
-                    )
-                with tds_action_cols[2]:
-                    st.caption("Runs CORE_INTERNAL.RUN_CORTEX_TDS_EXPLANATION_ASSIST. Official TDS and machine cost remain unchanged.")
-
-                if run_tds_with_note_clicked or run_tds_without_note_clicked:
-                    try:
-                        selected_note_id = None
-
-                        with st.spinner("Running Cortex TDS Explanation Assist..."):
-                            if run_tds_with_note_clicked:
-                                normalized_note_id = normalize_id(maintenance_note_id, "Maintenance Note ID")
-                                if not tds_note_text.strip():
-                                    raise ValueError("Please enter a maintenance/tooling note, or use Run Without Note.")
-
-                                upsert_tooling_maintenance_note(
-                                    maintenance_note_id=normalized_note_id,
-                                    simulation_id=risk_sim_id,
-                                    work_center_id=work_center_id,
-                                    source_name=tds_source_name,
-                                    note_title=tds_note_title,
-                                    note_text=tds_note_text.strip(),
-                                )
-                                selected_note_id = normalized_note_id
-
-                            tds_result = run_cortex_tds_explanation_assist(
-                                simulation_id=risk_sim_id,
-                                maintenance_note_id=selected_note_id,
-                            )
-
-                        st.session_state["last_tds_maintenance_note_id"] = selected_note_id or "NO_NOTE"
-                        st.session_state["last_tds_assist_result"] = tds_result
-
-                        if tds_result.get("status") == "SUCCESS":
-                            note("Cortex TDS explanation assist completed successfully.", "success")
-                        else:
-                            note("Cortex TDS explanation assist did not return SUCCESS.", "warning")
-
-                        st.json(tds_result)
-
-                    except Exception as exc:
-                        st.error(f"Cortex TDS explanation assist failed: {exc}")
-
-                tds_assist_df = load_cortex_tds_explanation_assist(risk_sim_id, limit=1)
-
-                if tds_assist_df.empty:
-                    note("No Cortex TDS explanation found yet for this simulation. Run TDS Assist to generate one.", "soft")
-                else:
-                    tds_row = tds_assist_df.iloc[0]
-
-                    strain_cols = st.columns(4)
-                    with strain_cols[0]:
-                        kpi_card(
-                            "Cortex Strain Band",
-                            str(tds_row.get("CORTEX_TOOLING_STRAIN_BAND", "N/A")),
-                            "Advisory classification",
-                            "rgba(177,151,252,0.22)",
-                        )
-                    with strain_cols[1]:
-                        kpi_card(
-                            "Extracted Severity",
-                            str(tds_row.get("CORTEX_EXTRACTED_SEVERITY", "N/A")),
-                            str(tds_row.get("CORTEX_EXTRACTED_WORK_CENTER", "")),
-                            "rgba(255,143,171,0.20)",
-                        )
-                    with strain_cols[2]:
-                        kpi_card(
-                            "Related Operation",
-                            str(tds_row.get("CORTEX_EXTRACTED_RELATED_OPERATION", "N/A")),
-                            str(tds_row.get("CORTEX_EXTRACTED_STRAIN_SIGNAL", "")),
-                            "rgba(255,209,102,0.20)",
-                        )
-                    with strain_cols[3]:
-                        override_flag = bool(tds_row.get("OFFICIAL_COST_OVERRIDE_FLAG", False))
-                        kpi_card(
-                            "TDS Override",
-                            "YES" if override_flag else "NO",
-                            str(tds_row.get("ASSIST_METHOD", "N/A")),
-                            "rgba(126,247,196,0.18)",
-                        )
-
-                    signal_record = {
-                        "Maintenance Note ID": tds_row.get("MAINTENANCE_NOTE_ID", ""),
-                        "Extracted Work Center": tds_row.get("CORTEX_EXTRACTED_WORK_CENTER", ""),
-                        "Strain Signal": tds_row.get("CORTEX_EXTRACTED_STRAIN_SIGNAL", ""),
-                        "Severity": tds_row.get("CORTEX_EXTRACTED_SEVERITY", ""),
-                        "Related Operation": tds_row.get("CORTEX_EXTRACTED_RELATED_OPERATION", ""),
-                        "Impact": tds_row.get("CORTEX_EXTRACTED_IMPACT", ""),
-                    }
-                    st.dataframe(vertical_record_table(signal_record), use_container_width=True, hide_index=True)
-
-                    st.markdown("#### TDS Reasoning")
-                    st.write(tds_row.get("CORTEX_REASONING", ""))
-
-                    st.markdown("#### Engineering Review Note")
-                    st.write(tds_row.get("CORTEX_ENGINEERING_REVIEW_NOTE", ""))
-
-                    st.dataframe(tds_assist_df, use_container_width=True, hide_index=True)
-
-                recent_tds_df = load_cortex_tds_explanation_assist(limit=10)
-                if not recent_tds_df.empty:
-                    st.markdown("#### Recent TDS Explanation Assist Results")
-                    st.dataframe(recent_tds_df, use_container_width=True, hide_index=True)
-
-            with risk_tabs[6]:
-                st.markdown("#### Cortex Cost Explanation + Executive Summary")
-                note(
-                    "Advisory only: Cortex explains the official deterministic cost output. It does not override cost, CSS, FMIS, TDS, BMCS, or quote trust status.",
-                    "soft",
-                )
-
-                explanation_top_cols = st.columns(4)
-                with explanation_top_cols[0]:
-                    kpi_card(
-                        "Baseline Cost",
-                        money(row.get("BASELINE_TOTAL_COST_USD", 0)),
-                        "Official deterministic cost",
-                        "rgba(99,230,255,0.20)",
-                    )
-                with explanation_top_cols[1]:
-                    kpi_card(
-                        "Risk-Adjusted Cost",
-                        money(row.get("RISK_ADJUSTED_TOTAL_COST_USD", 0)),
-                        "Official CSS + FMIS + TDS output",
-                        "rgba(255,143,171,0.20)",
-                    )
-                with explanation_top_cols[2]:
-                    kpi_card(
-                        "Risk Uplift",
-                        money(row.get("TOTAL_RISK_UPLIFT_USD", 0)),
-                        f"{as_float(row.get('TOTAL_RISK_UPLIFT_PCT', 0)):.2f}% above baseline",
-                        "rgba(255,209,102,0.20)",
-                    )
-                with explanation_top_cols[3]:
-                    kpi_card(
-                        "Override",
-                        "NO",
-                        "Explanation layer only",
-                        "rgba(126,247,196,0.18)",
-                    )
-
-                explanation_action_cols = st.columns([1, 2])
-                with explanation_action_cols[0]:
-                    run_cost_explanation_clicked = st.button(
-                        "Generate Executive Summary",
-                        use_container_width=True,
-                        key=f"btn_cost_explanation_{risk_sim_id}",
-                    )
-                with explanation_action_cols[1]:
-                    st.caption("Runs CORE_INTERNAL.RUN_CORTEX_COST_EXPLANATION for the selected simulation. Official cost remains unchanged.")
-
-                if run_cost_explanation_clicked:
-                    try:
-                        with st.spinner("Generating Cortex cost explanation and executive summary..."):
-                            explanation_result = run_cortex_cost_explanation(risk_sim_id)
-
-                        st.session_state["last_cost_explanation_result"] = explanation_result
-
-                        if explanation_result.get("status") == "SUCCESS":
-                            note("Cortex cost explanation generated successfully.", "success")
-                        else:
-                            note("Cortex cost explanation did not return SUCCESS.", "warning")
-
-                        st.json(explanation_result)
-
-                    except Exception as exc:
-                        st.error(f"Cortex cost explanation failed: {exc}")
-
-                cost_explanation_df = load_cortex_cost_explanation_summary(risk_sim_id, limit=1)
-
-                if cost_explanation_df.empty:
-                    note("No Cortex cost explanation found yet for this simulation. Click Generate Executive Summary.", "soft")
-                else:
-                    explanation_row = cost_explanation_df.iloc[0]
-
-                    explanation_status_cols = st.columns(4)
-                    with explanation_status_cols[0]:
-                        kpi_card(
-                            "BMCS Trust",
-                            str(explanation_row.get("QUOTE_TRUST_STATUS", "N/A")),
-                            str(explanation_row.get("BMCS_REVIEW_STATUS", "N/A")),
-                            "rgba(177,151,252,0.20)",
-                        )
-                    with explanation_status_cols[1]:
-                        kpi_card(
-                            "CSS",
-                            f"{as_float(explanation_row.get('CSS_SCORE', 0)):.0f}",
-                            str(explanation_row.get("SCRAP_RISK_LEVEL", "N/A")),
-                            "rgba(255,143,171,0.20)",
-                        )
-                    with explanation_status_cols[2]:
-                        kpi_card(
-                            "FMIS",
-                            f"{as_float(explanation_row.get('AVG_WEIGHTED_FMIS', 1)):.4f}x",
-                            "Official weighted index",
-                            "rgba(99,230,255,0.20)",
-                        )
-                    with explanation_status_cols[3]:
-                        kpi_card(
-                            "TDS",
-                            f"{as_float(explanation_row.get('MAX_TDS_FACTOR', 1)):.2f}x",
-                            "Official max factor",
-                            "rgba(255,209,102,0.20)",
-                        )
-
-                    summary_tabs = st.tabs([
-                        "Executive Summary",
-                        "Cost Drivers",
-                        "Risk Uplift",
-                        "BMCS Trust",
-                        "Engineering Note",
-                        "Raw Row",
-                    ])
-
-                    with summary_tabs[0]:
-                        st.write(explanation_row.get("EXECUTIVE_SUMMARY", ""))
-                    with summary_tabs[1]:
-                        st.write(explanation_row.get("COST_DRIVER_EXPLANATION", ""))
-                    with summary_tabs[2]:
-                        st.write(explanation_row.get("RISK_UPLIFT_EXPLANATION", ""))
-                    with summary_tabs[3]:
-                        st.write(explanation_row.get("BMCS_TRUST_EXPLANATION", ""))
-                    with summary_tabs[4]:
-                        st.write(explanation_row.get("ENGINEERING_REVIEW_NOTE", ""))
-                    with summary_tabs[5]:
-                        st.dataframe(cost_explanation_df, use_container_width=True, hide_index=True)
-
-                recent_explanation_df = load_cortex_cost_explanation_summary(limit=10)
-                if not recent_explanation_df.empty:
-                    st.markdown("#### Recent Cost Explanation Results")
-                    recent_cols = [
-                        "SIMULATION_ID",
-                        "RFQ_ID",
-                        "BASELINE_TOTAL_COST_USD",
-                        "RISK_ADJUSTED_TOTAL_COST_USD",
-                        "TOTAL_RISK_UPLIFT_PCT",
-                        "QUOTE_TRUST_STATUS",
-                        "ASSESSMENT_STATUS",
-                        "UPDATED_AT",
-                    ]
-                    recent_cols = [c for c in recent_cols if c in recent_explanation_df.columns]
-                    st.dataframe(
-                        format_table_money(recent_explanation_df[recent_cols], [
-                            "BASELINE_TOTAL_COST_USD",
-                            "RISK_ADJUSTED_TOTAL_COST_USD",
-                        ]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-            with risk_tabs[7]:
                 st.write(row.get("RISK_CALCULATION_NOTES", "No notes found."))
                 note("Baseline cost remains the audit foundation. Risk-adjusted cost adds explainable CSS, FMIS, and TDS adjustments; BMCS controls whether an RFQ-derived quotation is trusted, review-recommended, or preliminary.", "soft")
 
 # -----------------------------
-# Tab 5: Scenario History
+# Tab 5: Governed Decisions
 # -----------------------------
 
 with main_tabs[4]:
+    section("Governed Decision and Cost Authority", "🧭")
+    st.markdown(
+        '<div class="tab-subtitle">'
+        'Compare deterministic rules, ML advisory values, approved '
+        'overrides, safe defaults, and the final governed values used '
+        'by the current policy. This tab does not activate a deployment '
+        'or enable runtime authority.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    section("Secure Runtime and Privilege Control Plane", "🔐")
+
+    try:
+        security_control_df = load_security_control_dashboard()
+    except Exception as exc:
+        security_control_df = pd.DataFrame()
+        note(
+            "Security dashboard is unavailable to the active role: "
+            f"{exc}",
+            "warning",
+        )
+
+    try:
+        runtime_authority_df = load_runtime_authority_dashboard()
+    except Exception as exc:
+        runtime_authority_df = pd.DataFrame()
+        note(
+            "Runtime-authority dashboard is unavailable to the "
+            f"active role: {exc}",
+            "warning",
+        )
+
+    try:
+        policy_seal_df = load_policy_seal_integrity()
+    except Exception as exc:
+        policy_seal_df = pd.DataFrame()
+        note(
+            "Policy-seal integrity view is unavailable to the "
+            f"active role: {exc}",
+            "warning",
+        )
+
+    security_row = (
+        security_control_df.iloc[0]
+        if not security_control_df.empty
+        else pd.Series(dtype=object)
+    )
+
+    open_runtime_path_count = (
+        int(
+            runtime_authority_df[
+                "RUNTIME_CANDIDATE_PATH_OPEN_FLAG"
+            ].fillna(False).astype(bool).sum()
+        )
+        if (
+            not runtime_authority_df.empty
+            and "RUNTIME_CANDIDATE_PATH_OPEN_FLAG"
+                in runtime_authority_df.columns
+        )
+        else 0
+    )
+
+    enabled_runtime_authority_count = (
+        int(
+            (
+                runtime_authority_df[
+                    "AUTHORITY_STATUS"
+                ].astype(str).str.upper()
+                == "ENABLED"
+            ).sum()
+        )
+        if (
+            not runtime_authority_df.empty
+            and "AUTHORITY_STATUS"
+                in runtime_authority_df.columns
+        )
+        else 0
+    )
+
+    security_violation_count = sum(
+        int(
+            as_float(
+                security_row.get(column_name, 0)
+            )
+        )
+        for column_name in [
+            "MISSING_REQUIRED_GRANT_COUNT",
+            "BYPASS_GRANT_VIOLATION_COUNT",
+            "FUNCTIONAL_ROLE_DML_VIOLATION_COUNT",
+            "APPEND_ONLY_VIOLATION_COUNT",
+            "POLICY_SEAL_MISMATCH_COUNT",
+            "OVERRIDE_PRECEDENCE_VIOLATION_COUNT",
+        ]
+    )
+
+    active_policy_seal_count = (
+        int(
+            policy_seal_df[
+                "ACTIVE_SEAL_PRESENT_FLAG"
+            ].fillna(False).astype(bool).sum()
+        )
+        if (
+            not policy_seal_df.empty
+            and "ACTIVE_SEAL_PRESENT_FLAG"
+                in policy_seal_df.columns
+        )
+        else 0
+    )
+
+    security_cols = st.columns(5)
+    with security_cols[0]:
+        kpi_card(
+            "Snowflake User",
+            actual_snowflake_user,
+            active_snowflake_role,
+            "rgba(99,230,255,0.20)",
+        )
+    with security_cols[1]:
+        kpi_card(
+            "Security State",
+            optional_text(
+                security_row.get(
+                    "SECURITY_CONTROL_STATUS"
+                ),
+                "UNAVAILABLE",
+            ),
+            f"{security_violation_count} detected violation(s)",
+            (
+                "rgba(126,247,196,0.22)"
+                if security_violation_count == 0
+                else "rgba(255,143,171,0.24)"
+            ),
+        )
+    with security_cols[2]:
+        kpi_card(
+            "Runtime Paths Open",
+            str(open_runtime_path_count),
+            "Candidate path requires all gates",
+            (
+                "rgba(126,247,196,0.22)"
+                if open_runtime_path_count > 0
+                else "rgba(255,209,102,0.22)"
+            ),
+        )
+    with security_cols[3]:
+        kpi_card(
+            "Enabled Authorities",
+            str(enabled_runtime_authority_count),
+            "Expected zero before a real pilot",
+            "rgba(177,151,252,0.20)",
+        )
+    with security_cols[4]:
+        kpi_card(
+            "Active Policy Seals",
+            str(active_policy_seal_count),
+            "Created only by secure activation",
+            "rgba(255,209,102,0.20)",
+        )
+
+    if security_violation_count > 0:
+        note(
+            "The privilege dashboard reports a control violation. "
+            "Do not use any runtime candidate path until the grant "
+            "snapshot and integrity findings are resolved.",
+            "warning",
+        )
+    elif open_runtime_path_count == 0:
+        note(
+            "All runtime candidate paths are closed. The deterministic "
+            "governed cost hierarchy remains the operational result.",
+            "success",
+        )
+    else:
+        note(
+            "At least one runtime candidate path is open. Every "
+            "candidate decision must pass through the secure runtime "
+            "resolver and can still fall back deterministically.",
+            "warning",
+        )
+
+    with st.expander(
+        "Runtime authority, policy seals, and security dashboard",
+        expanded=False,
+    ):
+        security_tabs = st.tabs(
+            [
+                "Runtime Authority",
+                "Policy Seals",
+                "Privilege Dashboard",
+            ]
+        )
+        with security_tabs[0]:
+            st.dataframe(
+                runtime_authority_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        with security_tabs[1]:
+            st.dataframe(
+                policy_seal_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        with security_tabs[2]:
+            st.dataframe(
+                security_control_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(
+            "Official activation entry point: "
+            f"{SECURE_ACTIVATION_ENTRY_POINT}. "
+            "Activation and runtime enablement are intentionally not "
+            "available as Streamlit buttons."
+        )
+
+    governed_history_df = load_history(250)
+    governed_ids = (
+        list(
+            dict.fromkeys(
+                governed_history_df["SIMULATION_ID"]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+        )
+        if not governed_history_df.empty
+        else []
+    )
+
+    if not governed_ids:
+        note(
+            "Run a governed simulation before opening the decision view.",
+            "soft",
+        )
+    else:
+        default_governed_id = st.session_state.get(
+            "last_simulation_id",
+            governed_ids[0],
+        )
+        if default_governed_id not in governed_ids:
+            default_governed_id = governed_ids[0]
+
+        governed_sim_id = st.selectbox(
+            "Select governed simulation",
+            governed_ids,
+            index=governed_ids.index(default_governed_id),
+            key="phase10c_simulation_id",
+        )
+
+        governed_df = load_phase10c_decision_display(
+            governed_sim_id
+        )
+
+        if governed_df.empty:
+            note(
+                "No Phase 10B hierarchy row exists for this simulation. "
+                "Run the simulation through "
+                "RUN_KMAT_COST_SIMULATION_GOVERNED_V3 first.",
+                "warning",
+            )
+        else:
+            governed_row = governed_df.iloc[0]
+
+            try:
+                secure_runtime_input_df = (
+                    load_streamlit_runtime_inputs(
+                        governed_sim_id
+                    )
+                )
+            except Exception as exc:
+                secure_runtime_input_df = pd.DataFrame()
+                note(
+                    "The secure Streamlit runtime-input view is "
+                    "not available. Runtime execution remains "
+                    f"disabled. Details: {exc}",
+                    "soft",
+                )
+
+            safety_pass = bool(
+                governed_row.get(
+                    "SAFETY_GATE_PASS_FLAG",
+                    False,
+                )
+            )
+            consumption_allowed = bool(
+                governed_row.get(
+                    "COST_ENGINE_CONSUMPTION_ALLOWED_FLAG",
+                    False,
+                )
+            )
+            recalc_required = bool(
+                governed_row.get(
+                    "OFFICIAL_COST_RECALCULATION_REQUIRED_FLAG",
+                    False,
+                )
+            )
+            any_ml_used = bool(
+                governed_row.get("ANY_ML_USED_FLAG", False)
+            )
+            any_override_used = bool(
+                governed_row.get(
+                    "ANY_OVERRIDE_USED_FLAG",
+                    False,
+                )
+            )
+            any_default_used = bool(
+                governed_row.get(
+                    "ANY_SAFE_DEFAULT_USED_FLAG",
+                    False,
+                )
+            )
+
+            if any_override_used:
+                authority_label = "Engineer Override"
+            elif any_ml_used:
+                authority_label = "Governed ML"
+            elif any_default_used:
+                authority_label = "Safe Default"
+            else:
+                authority_label = "Deterministic Rule"
+
+            top_cols = st.columns(5)
+            with top_cols[0]:
+                kpi_card(
+                    "Resolution",
+                    str(
+                        governed_row.get(
+                            "RESOLUTION_STATUS",
+                            "N/A",
+                        )
+                    ),
+                    str(
+                        governed_row.get(
+                            "DISPLAY_DEPLOYMENT_MODE",
+                            "N/A",
+                        )
+                    ),
+                    "rgba(99,230,255,0.20)",
+                )
+            with top_cols[1]:
+                kpi_card(
+                    "Safety Gate",
+                    "PASS" if safety_pass else "BLOCKED",
+                    str(
+                        governed_row.get(
+                            "RESOLUTION_REASON",
+                            "No reason available.",
+                        )
+                    ),
+                    (
+                        "rgba(126,247,196,0.22)"
+                        if safety_pass
+                        else "rgba(255,143,171,0.24)"
+                    ),
+                )
+            with top_cols[2]:
+                kpi_card(
+                    "Cost Contract",
+                    (
+                        "READY"
+                        if consumption_allowed
+                        else "BLOCKED"
+                    ),
+                    (
+                        "No cost recalculation required"
+                        if not recalc_required
+                        else "Official cost recalculation required"
+                    ),
+                    (
+                        "rgba(126,247,196,0.22)"
+                        if consumption_allowed
+                        else "rgba(255,209,102,0.24)"
+                    ),
+                )
+            with top_cols[3]:
+                kpi_card(
+                    "Final Authority",
+                    authority_label,
+                    "Override → ML → Rule → Default",
+                    "rgba(177,151,252,0.22)",
+                )
+            with top_cols[4]:
+                kpi_card(
+                    "Quote Trust",
+                    str(
+                        governed_row.get(
+                            "OFFICIAL_QUOTE_TRUST_STATUS",
+                            "N/A",
+                        )
+                    ),
+                    (
+                        "Trusted cost allowed"
+                        if bool(
+                            governed_row.get(
+                                "OFFICIAL_TRUSTED_COST_ALLOWED_FLAG",
+                                False,
+                            )
+                        )
+                        else "Trusted cost not allowed"
+                    ),
+                    "rgba(255,209,102,0.22)",
+                )
+
+            if recalc_required:
+                note(
+                    "A resolved factor differs from the factor already "
+                    "used by the official engine. The contract is blocked "
+                    "until cost is recalculated using that resolved value.",
+                    "warning",
+                )
+            elif safety_pass and consumption_allowed:
+                note(
+                    "The hierarchy is safe. Under the current SHADOW "
+                    "policies, ML and approved overrides remain advisory "
+                    "and deterministic factors remain official.",
+                    "success",
+                )
+            else:
+                note(
+                    "The hierarchy is currently blocked. Review the "
+                    "resolution reason before using the cost result.",
+                    "warning",
+                )
+
+            section("Rule → ML → Override → Final", "🔀")
+            factor_table = build_governed_factor_table(
+                governed_row
+            )
+            st.dataframe(
+                factor_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            section("Secure Runtime Boundary", "🔒")
+            st.markdown(
+                '<div class="tab-subtitle">'
+                'This control is inactive while the domain path is '
+                'blocked. It becomes callable only when the database '
+                'reports an open runtime path and the governed decision '
+                'row contains explicit candidate, quality, and OOD '
+                'metadata. No safety flag is invented by the UI.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            runtime_domain = st.selectbox(
+                "Runtime model domain",
+                ["CSS", "FMIS", "TDS", "BMCS"],
+                key="secure_runtime_domain",
+            )
+
+            runtime_input = (
+                extract_runtime_input_from_secure_view(
+                    secure_runtime_input_df,
+                    runtime_domain,
+                    governed_row,
+                )
+            )
+
+            domain_runtime_row = pd.Series(dtype=object)
+            if (
+                not runtime_authority_df.empty
+                and "MODEL_DOMAIN"
+                    in runtime_authority_df.columns
+            ):
+                domain_match = runtime_authority_df[
+                    runtime_authority_df[
+                        "MODEL_DOMAIN"
+                    ].astype(str).str.upper()
+                    == runtime_domain
+                ]
+                if not domain_match.empty:
+                    domain_runtime_row = (
+                        domain_match.iloc[0]
+                    )
+
+            domain_path_open = bool(
+                domain_runtime_row.get(
+                    "RUNTIME_CANDIDATE_PATH_OPEN_FLAG",
+                    False,
+                )
+            )
+            require_engineer_approval = bool(
+                domain_runtime_row.get(
+                    "REQUIRE_ENGINEER_APPROVAL_FLAG",
+                    False,
+                )
+            )
+
+            runtime_cols = st.columns(4)
+            with runtime_cols[0]:
+                kpi_card(
+                    "Domain Path",
+                    (
+                        "OPEN"
+                        if domain_path_open
+                        else "BLOCKED"
+                    ),
+                    optional_text(
+                        domain_runtime_row.get(
+                            "AUTHORITY_STATUS"
+                        ),
+                        "No enabled authority",
+                    ),
+                    (
+                        "rgba(126,247,196,0.22)"
+                        if domain_path_open
+                        else "rgba(255,143,171,0.22)"
+                    ),
+                )
+            with runtime_cols[1]:
+                kpi_card(
+                    "Rule Value",
+                    optional_score(
+                        runtime_input.get(
+                            "rule_value"
+                        )
+                    ),
+                    optional_text(
+                        runtime_input.get("rule_key"),
+                        "Unavailable",
+                    ),
+                    "rgba(99,230,255,0.18)",
+                )
+            with runtime_cols[2]:
+                kpi_card(
+                    "Candidate Value",
+                    optional_score(
+                        runtime_input.get(
+                            "candidate_value"
+                        )
+                    ),
+                    optional_text(
+                        runtime_input.get(
+                            "candidate_key"
+                        ),
+                        "Unavailable",
+                    ),
+                    "rgba(177,151,252,0.18)",
+                )
+            with runtime_cols[3]:
+                kpi_card(
+                    "Inference Metadata",
+                    (
+                        "READY"
+                        if runtime_input.get("ready")
+                        else "INCOMPLETE"
+                    ),
+                    (
+                        "Inference, quality, and OOD are explicit"
+                        if runtime_input.get("ready")
+                        else runtime_input.get(
+                            "reason",
+                            "Unavailable",
+                        )
+                    ),
+                    (
+                        "rgba(126,247,196,0.18)"
+                        if runtime_input.get("ready")
+                        else "rgba(255,209,102,0.20)"
+                    ),
+                )
+
+            engineer_approved = False
+            engineer_reference = None
+
+            if require_engineer_approval:
+                engineer_cols = st.columns([0.8, 1.8])
+                with engineer_cols[0]:
+                    engineer_approved = st.checkbox(
+                        "Engineer approval confirmed",
+                        value=False,
+                        key=(
+                            "secure_runtime_engineer_approved_"
+                            f"{runtime_domain}"
+                        ),
+                    )
+                with engineer_cols[1]:
+                    engineer_reference = st.text_input(
+                        "Engineer approval reference",
+                        value="",
+                        key=(
+                            "secure_runtime_engineer_reference_"
+                            f"{runtime_domain}"
+                        ),
+                    )
+
+            runtime_acknowledged = st.checkbox(
+                "I understand that this records an auditable runtime "
+                "decision and never bypasses deterministic fallback.",
+                value=False,
+                key=(
+                    "secure_runtime_acknowledged_"
+                    f"{governed_sim_id}_{runtime_domain}"
+                ),
+            )
+
+            engineer_gate_pass = (
+                not require_engineer_approval
+                or (
+                    engineer_approved
+                    and bool(
+                        str(
+                            engineer_reference or ""
+                        ).strip()
+                    )
+                )
+            )
+
+            runtime_call_ready = (
+                domain_path_open
+                and bool(
+                    runtime_input.get("ready")
+                )
+                and bool(
+                    runtime_input.get(
+                        "inference_success_flag",
+                        False,
+                    )
+                )
+                and security_violation_count == 0
+                and runtime_acknowledged
+                and engineer_gate_pass
+            )
+
+            if not domain_path_open:
+                note(
+                    "The database runtime path is BLOCKED for "
+                    f"{runtime_domain}. The secure resolver button "
+                    "remains disabled and deterministic values remain "
+                    "official.",
+                    "soft",
+                )
+            elif not runtime_input.get("ready"):
+                note(
+                    "The runtime path is open, but this simulation does "
+                    "not expose a complete secure runtime-input "
+                    "record. Candidate execution remains disabled.",
+                    "warning",
+                )
+
+            execute_runtime_clicked = st.button(
+                "Resolve Through Secure Runtime Boundary",
+                type="primary",
+                use_container_width=True,
+                disabled=not runtime_call_ready,
+                key=(
+                    "secure_runtime_resolve_"
+                    f"{governed_sim_id}_{runtime_domain}"
+                ),
+            )
+
+            if execute_runtime_clicked:
+                try:
+                    runtime_decision_id = (
+                        make_runtime_decision_id(
+                            runtime_domain,
+                            governed_sim_id,
+                        )
+                    )
+
+                    with st.spinner(
+                        "Resolving the candidate through the secure "
+                        "Snowflake runtime boundary..."
+                    ):
+                        runtime_result = (
+                            resolve_secure_runtime_authority(
+                                runtime_decision_id=(
+                                    runtime_decision_id
+                                ),
+                                model_domain=runtime_domain,
+                                simulation_id=governed_sim_id,
+
+                                rule_value=runtime_input.get(
+                                    "rule_value"
+                                ),
+                                candidate_value=(
+                                    runtime_input.get(
+                                        "candidate_value"
+                                    )
+                                ),
+
+                                quality_pass_flag=bool(
+                                    runtime_input.get(
+                                        "quality_pass_flag"
+                                    )
+                                ),
+                                ood_flag=bool(
+                                    runtime_input.get(
+                                        "ood_flag"
+                                    )
+                                ),
+
+                                engineer_approved_flag=(
+                                    engineer_approved
+                                ),
+                                engineer_approval_reference=(
+                                    engineer_reference
+                                ),
+                            )
+                        )
+
+                    st.session_state[
+                        "last_secure_runtime_result"
+                    ] = runtime_result
+
+                    if runtime_result.get("status") == "SUCCESS":
+                        runtime_authorised = bool(
+                            runtime_result.get(
+                                "runtime_authorised",
+                                False,
+                            )
+                        )
+                        note(
+                            "Secure runtime decision recorded. "
+                            f"Runtime authorised: "
+                            f"{'YES' if runtime_authorised else 'NO'}. "
+                            f"Final source: "
+                            f"{runtime_result.get('final_runtime_source', 'N/A')}.",
+                            (
+                                "success"
+                                if runtime_authorised
+                                else "warning"
+                            ),
+                        )
+                    else:
+                        note(
+                            "Secure runtime resolution did not return "
+                            "SUCCESS.",
+                            "warning",
+                        )
+
+                    st.json(runtime_result)
+
+                except Exception as exc:
+                    st.error(
+                        "Secure runtime resolution failed: "
+                        f"{exc}"
+                    )
+
+            try:
+                runtime_decision_df = (
+                    load_runtime_decisions(
+                        governed_sim_id,
+                        50,
+                    )
+                )
+            except Exception as exc:
+                runtime_decision_df = pd.DataFrame()
+                note(
+                    "Runtime decision history is unavailable to the "
+                    f"active role: {exc}",
+                    "soft",
+                )
+
+            with st.expander(
+                "Auditable runtime decisions for this simulation",
+                expanded=False,
+            ):
+                if runtime_decision_df.empty:
+                    note(
+                        "No secure runtime decision has been recorded "
+                        "for this simulation.",
+                        "soft",
+                    )
+                else:
+                    st.dataframe(
+                        runtime_decision_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                try:
+                    approved_override_df = (
+                        load_approved_override_display(
+                            governed_sim_id
+                        )
+                    )
+                except Exception:
+                    approved_override_df = pd.DataFrame()
+
+                st.markdown(
+                    "**Approved override precedence (V2)**"
+                )
+                if approved_override_df.empty:
+                    note(
+                        "No governed override row is available for "
+                        "this simulation or the active role does not "
+                        "have access to the secure view.",
+                        "soft",
+                    )
+                else:
+                    st.dataframe(
+                        approved_override_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            detail_cols = st.columns(3)
+            with detail_cols[0]:
+                kpi_card(
+                    "Official Risk Cost",
+                    money(
+                        governed_row.get(
+                            "OFFICIAL_RISK_ADJUSTED_TOTAL_COST_USD",
+                            0,
+                        )
+                    ),
+                    "Stored deterministic/risk-adjusted result",
+                    "rgba(255,143,171,0.20)",
+                )
+            with detail_cols[1]:
+                kpi_card(
+                    "Official Target Price",
+                    money(
+                        governed_row.get(
+                            "OFFICIAL_TARGET_PRICE_USD",
+                            0,
+                        )
+                    ),
+                    "Stored official target price",
+                    "rgba(99,230,255,0.20)",
+                )
+            with detail_cols[2]:
+                kpi_card(
+                    "BMCS Final Status",
+                    str(
+                        governed_row.get(
+                            "RESOLVED_BMCS_STATUS",
+                            "N/A",
+                        )
+                    ),
+                    str(
+                        governed_row.get(
+                            "BMCS_RESOLVED_SOURCE",
+                            "N/A",
+                        )
+                    ),
+                    "rgba(177,151,252,0.22)",
+                )
+
+            section("BMCS Trust and Review Gate", "🧠")
+            bmcs_cols = st.columns(4)
+            with bmcs_cols[0]:
+                kpi_card(
+                    "BMCS ML Score",
+                    optional_score(
+                        governed_row.get("BMCS_ML_SCORE")
+                    ),
+                    "Advisory only",
+                    "rgba(99,230,255,0.18)",
+                )
+            with bmcs_cols[1]:
+                kpi_card(
+                    "Official Status",
+                    str(
+                        governed_row.get(
+                            "BMCS_OFFICIAL_STATUS",
+                            "N/A",
+                        )
+                    ),
+                    "Phase 7/manual configuration result",
+                    "rgba(126,247,196,0.18)",
+                )
+            with bmcs_cols[2]:
+                kpi_card(
+                    "Approved Override",
+                    str(
+                        governed_row.get(
+                            "BMCS_OVERRIDE_STATUS",
+                            "—",
+                        )
+                    ),
+                    (
+                        "Eligible"
+                        if bool(
+                            governed_row.get(
+                                "BMCS_OVERRIDE_ELIGIBLE_FLAG",
+                                False,
+                            )
+                        )
+                        else "Not eligible under current policy"
+                    ),
+                    "rgba(255,209,102,0.18)",
+                )
+            with bmcs_cols[3]:
+                kpi_card(
+                    "Safe Default",
+                    str(
+                        governed_row.get(
+                            "BMCS_SAFE_DEFAULT_STATUS",
+                            "REVIEW_REQUIRED",
+                        )
+                    ),
+                    "Used only when official status is unavailable",
+                    "rgba(255,143,171,0.18)",
+                )
+
+            section("Policy and Model Lineage", "🧬")
+            lineage_df = build_model_lineage_table(
+                governed_row
+            )
+            st.dataframe(
+                lineage_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander(
+                "Resolution reasons and control flags",
+                expanded=False,
+            ):
+                reason_rows = pd.DataFrame(
+                    [
+                        {
+                            "Domain": "CSS",
+                            "Final Source": governed_row.get(
+                                "CSS_RESOLVED_SOURCE",
+                                "N/A",
+                            ),
+                            "Reason": governed_row.get(
+                                "CSS_RESOLUTION_REASON",
+                                "",
+                            ),
+                        },
+                        {
+                            "Domain": "FMIS",
+                            "Final Source": governed_row.get(
+                                "FMIS_RESOLVED_SOURCE",
+                                "N/A",
+                            ),
+                            "Reason": governed_row.get(
+                                "FMIS_RESOLUTION_REASON",
+                                "",
+                            ),
+                        },
+                        {
+                            "Domain": "TDS",
+                            "Final Source": governed_row.get(
+                                "TDS_RESOLVED_SOURCE",
+                                "N/A",
+                            ),
+                            "Reason": governed_row.get(
+                                "TDS_RESOLUTION_REASON",
+                                "",
+                            ),
+                        },
+                        {
+                            "Domain": "BMCS",
+                            "Final Source": governed_row.get(
+                                "BMCS_RESOLVED_SOURCE",
+                                "N/A",
+                            ),
+                            "Reason": governed_row.get(
+                                "BMCS_RESOLUTION_REASON",
+                                "",
+                            ),
+                        },
+                    ]
+                )
+                st.dataframe(
+                    reason_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                control_rows = pd.DataFrame(
+                    [
+                        {
+                            "Control": "Any override used",
+                            "Value": yes_no(any_override_used),
+                        },
+                        {
+                            "Control": "Any ML used",
+                            "Value": yes_no(any_ml_used),
+                        },
+                        {
+                            "Control": "Any safe default used",
+                            "Value": yes_no(any_default_used),
+                        },
+                        {
+                            "Control": "Cost recalculation required",
+                            "Value": yes_no(recalc_required),
+                        },
+                        {
+                            "Control": "Business review update required",
+                            "Value": yes_no(
+                                governed_row.get(
+                                    "BUSINESS_REVIEW_UPDATE_REQUIRED_FLAG",
+                                    False,
+                                )
+                            ),
+                        },
+                        {
+                            "Control": "Cost consumption allowed",
+                            "Value": yes_no(
+                                consumption_allowed
+                            ),
+                        },
+                    ]
+                )
+                st.dataframe(
+                    control_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            section("Governance Audit Trail", "🧾")
+            audit_df = load_phase10c_audit(
+                governed_sim_id,
+                50,
+            )
+            if audit_df.empty:
+                note(
+                    "No Phase 10A or Phase 10B audit events found.",
+                    "soft",
+                )
+            else:
+                st.dataframe(
+                    audit_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "Download governance audit CSV",
+                    data=dataframe_to_csv_bytes(audit_df),
+                    file_name=(
+                        f"{governed_sim_id}"
+                        "_governance_audit.csv"
+                    ),
+                    mime="text/csv",
+                    key="download_phase10c_audit",
+                )
+
+            with st.expander(
+                "Latest governed procedure JSON",
+                expanded=False,
+            ):
+                st.json(
+                    st.session_state.get(
+                        "last_procedure_result",
+                        {},
+                    )
+                )
+
+
+# -----------------------------
+# Tab 6: Scenario History
+# -----------------------------
+
+with main_tabs[5]:
     section("Saved Simulation History", "📜")
     st.markdown('<div class="tab-subtitle">Every run is stored by SIMULATION_ID, making the dashboard useful for audit trails and comparison.</div>', unsafe_allow_html=True)
     history_limit = st.slider("Rows to show", min_value=10, max_value=500, value=100, step=10)
@@ -3543,10 +4875,10 @@ with main_tabs[4]:
         )
 
 # -----------------------------
-# Tab 6: Compare Scenarios
+# Tab 7: Compare Scenarios
 # -----------------------------
 
-with main_tabs[5]:
+with main_tabs[6]:
     section("Scenario Comparison", "📊")
     st.markdown('<div class="tab-subtitle">Choose a baseline and compare cost, price, profit, and cost-driver shifts.</div>', unsafe_allow_html=True)
     history_df = load_history(200)
@@ -3635,10 +4967,10 @@ with main_tabs[5]:
             st.caption("Target markup is markup on cost. Gross margin % is calculated as profit divided by target price.")
 
 # -----------------------------
-# Tab 7: Component Impact
+# Tab 8: Component Impact
 # -----------------------------
 
-with main_tabs[6]:
+with main_tabs[7]:
     section("Component-Level Impact", "🔍")
     st.markdown('<div class="tab-subtitle">Compare selected BOM components between two runs to explain why cost changed.</div>', unsafe_allow_html=True)
     history_df = load_history(200)
@@ -3688,10 +5020,10 @@ with main_tabs[6]:
             )
 
 # -----------------------------
-# Tab 8: Batch Demo Runner
+# Tab 9: Batch Demo Runner
 # -----------------------------
 
-with main_tabs[7]:
+with main_tabs[8]:
     section("One-Click Demo Scenario Runner", "🚀")
     st.markdown('<div class="tab-subtitle">Create a clean set of demo runs for presentation: baseline, cost inflation, markup change, and economy truck.</div>', unsafe_allow_html=True)
 
@@ -3794,17 +5126,15 @@ with main_tabs[1]:
         final_allowed = bool(selected_rfq.get("FINAL_TRUSTED_COST_ALLOWED_FLAG", False))
         review_required = bool(selected_rfq.get("REVIEW_REQUIRED_FLAG", False))
 
-        top_cols = st.columns(5)
+        top_cols = st.columns(4)
         with top_cols[0]:
-            kpi_card("Rule BMCS", f"{as_float(selected_rfq.get('RULE_BASED_BMCS_SCORE', 0)):.2f}%", "Rule-based text match", "rgba(99,230,255,0.20)")
+            kpi_card("BMCS", f"{score:.0f}%", review_status, "rgba(126,247,196,0.20)" if score >= 90 else "rgba(255,209,102,0.22)" if score >= 70 else "rgba(255,143,171,0.24)")
         with top_cols[1]:
-            kpi_card("Cortex BMCS", f"{as_float(selected_rfq.get('CORTEX_BMCS_SCORE', 0)):.2f}%", "AI_COMPLETE assessment", "rgba(177,151,252,0.20)")
+            kpi_card("Review Required", "YES" if review_required else "NO", "Engineering gate", "rgba(255,143,171,0.20)" if review_required else "rgba(126,247,196,0.18)")
         with top_cols[2]:
-            kpi_card("Final BMCS", f"{score:.2f}%", str(selected_rfq.get("FINAL_BMCS_METHOD", "N/A")), "rgba(126,247,196,0.20)" if score >= 90 else "rgba(255,209,102,0.22)" if score >= 70 else "rgba(255,143,171,0.24)")
-        with top_cols[3]:
-            kpi_card("Review Required", "YES" if review_required else "NO", review_status, "rgba(255,143,171,0.20)" if review_required else "rgba(126,247,196,0.18)")
-        with top_cols[4]:
             kpi_card("Final Cost Allowed", "YES" if final_allowed else "NO", "Trusted quote flag", "rgba(126,247,196,0.18)" if final_allowed else "rgba(255,143,171,0.24)")
+        with top_cols[3]:
+            kpi_card("Risk Level", str(selected_rfq.get("BMCS_RISK_LEVEL", "N/A")), str(selected_rfq.get("RULE_VALIDATION_STATUS", "N/A")), "rgba(99,230,255,0.18)")
 
         if review_status == "AUTO_APPROVED":
             note("High-confidence RFQ mapping. The configuration can proceed automatically to costing.", "success")
@@ -3850,57 +5180,60 @@ with main_tabs[1]:
                 st.write(selected_rfq.get("EXTRACTED_CONFIGURATION_JSON"))
 
         section("BMCS Actions", "⚙️")
-        action_cols = st.columns(2)
+        action_cols = st.columns(3)
         with action_cols[0]:
-            hybrid_clicked = st.button(
-                "Run Hybrid Cortex BMCS",
-                use_container_width=True,
-                key="btn_run_hybrid_cortex_bmcs",
-            )
+            score_clicked = st.button("Run BMCS Scoring", use_container_width=True, key="btn_run_bmcs_scoring")
         with action_cols[1]:
-            full_clicked = st.button(
-                "Run Full RFQ Quote Pipeline",
-                type="primary",
-                use_container_width=True,
-                key="btn_full_rfq_flow",
-            )
+            prepare_clicked = st.button("Prepare RFQ Inputs", use_container_width=True, key="btn_prepare_rfq_inputs_bmcs")
+        with action_cols[2]:
+            full_clicked = st.button("Score + Prepare + Cost", type="primary", use_container_width=True, key="btn_full_rfq_flow")
 
-        if hybrid_clicked:
+        if score_clicked:
             try:
-                with st.spinner("Running hybrid Cortex BMCS assessment..."):
-                    result = run_cortex_bmcs_assessment(selected_rfq_id)
-                st.session_state["last_hybrid_bmcs_result"] = result
+                with st.spinner("Running rule-based BMCS scoring..."):
+                    result = run_bmcs_scoring(selected_rfq_id)
+                st.session_state["last_bmcs_result"] = result
                 if result.get("status") == "SUCCESS":
-                    note(f"Hybrid Cortex BMCS completed for {selected_rfq_id}.", "success")
+                    note(f"BMCS scoring completed for {selected_rfq_id}.", "success")
                     st.json(result)
                     soft_rerun()
                 else:
-                    note("Hybrid Cortex BMCS did not return SUCCESS.", "warning")
+                    note("BMCS scoring did not return SUCCESS.", "warning")
                     st.json(result)
             except Exception as exc:
-                st.error(f"Hybrid Cortex BMCS failed: {exc}")
+                st.error(f"BMCS scoring failed: {exc}")
+
+        if prepare_clicked:
+            try:
+                with st.spinner("Preparing RFQ simulation input tables..."):
+                    result = prepare_rfq_simulation_inputs(selected_rfq_id)
+                st.session_state["last_rfq_prepare_result"] = result
+                if result.get("status") == "SUCCESS":
+                    note(f"RFQ inputs prepared for simulation {result.get('simulation_id')}.", "success")
+                    st.json(result)
+                else:
+                    note("RFQ input preparation did not return SUCCESS.", "warning")
+                    st.json(result)
+            except Exception as exc:
+                st.error(f"RFQ preparation failed: {exc}")
 
         if full_clicked:
             try:
-                with st.spinner("Running hybrid BMCS, preparing simulation inputs, and running KMAT cost engine..."):
-                    result = run_cortex_rfq_quote_pipeline(selected_rfq_id)
+                with st.spinner("Scoring BMCS, preparing simulation inputs, and running KMAT cost engine..."):
+                    result = run_rfq_cost_flow(selected_rfq_id)
                 st.session_state["last_rfq_cost_flow_result"] = result
                 if result.get("status") == "SUCCESS":
                     sim_id = result.get("simulation_id")
                     st.session_state["last_simulation_id"] = sim_id
                     st.session_state["last_procedure_result"] = result.get("cost_result", {})
-                    note(
-                        f"Full RFQ quote pipeline completed for {selected_rfq_id}. "
-                        f"Trust status: {result.get('quote_trust_status')}",
-                        "success",
-                    )
+                    note(f"RFQ cost flow completed. Simulation {sim_id} is now available in the output tables.", "success")
                     st.json(result)
                     soft_rerun()
                 else:
-                    note("Full RFQ quote pipeline did not return SUCCESS.", "warning")
+                    note(f"RFQ cost flow stopped at stage {result.get('stage')}.", "warning")
                     st.json(result)
             except Exception as exc:
-                st.error(f"Full RFQ quote pipeline failed: {exc}")
+                st.error(f"RFQ cost flow failed: {exc}")
 
         section("Scoring Evidence", "🔎")
         detail_df = load_rfq_scoring_detail(selected_rfq_id)
@@ -3980,7 +5313,7 @@ with main_tabs[0]:
         <div class="rfq-callout">
             <div class="rfq-callout-title">Uniform RFQ-to-Cost Workflow</div>
             <div class="rfq-callout-text">
-                Step 1: Upload or paste RFQ → Step 2: Process with Cortex → Step 3: Run full hybrid BMCS quote pipeline.
+                Step 1: Upload or paste RFQ → Step 2: Process with Cortex → Step 3: Review BMCS → Step 4: Prepare simulation → Step 5: Run cost engine.
                 For PDF uploads, the Snowflake stage must use server-side encryption: <b>ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')</b>.
             </div>
         </div>
@@ -3998,7 +5331,7 @@ with main_tabs[0]:
     with flow_cols[3]:
         kpi_card("4. BMCS", "Validate", "Confidence + review status", "rgba(126,247,196,0.18)")
     with flow_cols[4]:
-        kpi_card("5. Costing", "Run", "Deterministic KMAT engine", "rgba(255,143,171,0.18)")
+        kpi_card("5. Costing", "Run", "Deterministic cost + governed hierarchy", "rgba(255,143,171,0.18)")
 
     st.markdown("---")
     section("RFQ Input", "🧾")
@@ -4067,7 +5400,7 @@ with main_tabs[0]:
             )
 
     note(
-        "Use the buttons from left to right. First process the RFQ with Cortex, then run the full RFQ quote pipeline. The pipeline preserves hybrid Cortex BMCS in the cost output.",
+        "Use the buttons from left to right. Process the RFQ with Cortex, run the existing RFQ quote pipeline, then attach Phase 10A/10B governance without overwriting the RFQ trust result.",
         "soft",
     )
 
@@ -4147,11 +5480,45 @@ with main_tabs[0]:
             st.session_state["last_cortex_quote_result"] = quote_result
     
             if quote_result.get("status") == "SUCCESS":
-                st.session_state["last_simulation_id"] = quote_result.get("simulation_id")
+                quote_simulation_id = quote_result.get(
+                    "simulation_id"
+                )
+                st.session_state["last_simulation_id"] = (
+                    quote_simulation_id
+                )
+
+                governance_result = (
+                    prepare_governance_for_existing_simulation(
+                        quote_simulation_id
+                    )
+                    if quote_simulation_id
+                    else {
+                        "status": "ERROR",
+                        "message": (
+                            "RFQ quote result did not return "
+                            "a simulation_id."
+                        ),
+                    }
+                )
+                quote_result["phase10c_governance"] = (
+                    governance_result
+                )
+                st.session_state[
+                    "last_procedure_result"
+                ] = governance_result
+
                 note(
-                    f"Full RFQ quote pipeline completed for {normalized_rfq_id}. "
-                    f"Trust status: {quote_result.get('quote_trust_status')}",
-                    "success",
+                    f"Full RFQ quote pipeline completed for "
+                    f"{normalized_rfq_id}. Trust status: "
+                    f"{quote_result.get('quote_trust_status')}. "
+                    f"Governance status: "
+                    f"{governance_result.get('status', 'UNKNOWN')}.",
+                    (
+                        "success"
+                        if governance_result.get("status")
+                        == "SUCCESS"
+                        else "warning"
+                    ),
                 )
             else:
                 note("Full RFQ quote pipeline did not return SUCCESS.", "warning")
@@ -4185,46 +5552,16 @@ with main_tabs[0]:
             r = status_df.iloc[0]
 
             status_cols = st.columns(5)
-
             with status_cols[0]:
-                kpi_card(
-                    "Rule BMCS",
-                    f"{as_float(r.get('RULE_BASED_BMCS_SCORE', 0)):.2f}%",
-                    "Rule-based score",
-                    "rgba(99,230,255,0.22)",
-                )
-
+                kpi_card("BMCS", f"{as_float(r.get('BOM_MATCH_CONFIDENCE_SCORE', 0)):.2f}%", str(r.get("REVIEW_STATUS", "N/A")), "rgba(99,230,255,0.22)")
             with status_cols[1]:
-                kpi_card(
-                    "Cortex BMCS",
-                    f"{as_float(r.get('CORTEX_BMCS_SCORE', 0)):.2f}%",
-                    "AI_COMPLETE score",
-                    "rgba(177,151,252,0.20)",
-                )
-
+                kpi_card("Review Status", str(r.get("REVIEW_STATUS", "N/A")), f"Final allowed: {r.get('FINAL_TRUSTED_COST_ALLOWED_FLAG', 'N/A')}", "rgba(255,209,102,0.22)")
             with status_cols[2]:
-                kpi_card(
-                    "Final BMCS",
-                    f"{as_float(r.get('BOM_MATCH_CONFIDENCE_SCORE', 0)):.2f}%",
-                    str(r.get("FINAL_BMCS_METHOD", "N/A")),
-                    "rgba(126,247,196,0.18)",
-                )
-
+                kpi_card("Complexity", str(r.get("RFQ_COMPLEXITY_CATEGORY", "N/A")), "AI_CLASSIFY result", "rgba(177,151,252,0.20)")
             with status_cols[3]:
-                kpi_card(
-                    "Review Status",
-                    str(r.get("REVIEW_STATUS", "N/A")),
-                    f"Final allowed: {r.get('FINAL_TRUSTED_COST_ALLOWED_FLAG', 'N/A')}",
-                    "rgba(255,209,102,0.22)",
-                )
-
+                kpi_card("Simulation", str(r.get("SIMULATION_ID", "N/A")), "RFQ-linked cost run", "rgba(126,247,196,0.18)")
             with status_cols[4]:
-                kpi_card(
-                    "Complexity",
-                    str(r.get("RFQ_COMPLEXITY_CATEGORY", "N/A")),
-                    "AI_CLASSIFY result",
-                    "rgba(255,143,171,0.20)",
-                )
+                kpi_card("Cortex Status", str(r.get("CORTEX_PROCESSING_STATUS", "N/A")), "Document intake status", "rgba(255,143,171,0.20)")
 
             section("Extracted KMAT Configuration", "🧩")
             config_cols = st.columns(4)
@@ -4236,70 +5573,6 @@ with main_tabs[0]:
                 config_chip("WHEEL", str(r.get("WHEEL", "N/A")))
             with config_cols[3]:
                 config_chip("COLOR", str(r.get("COLOR", "N/A")))
-
-            quote_summary_df = load_rfq_quote_summary(normalize_id(rfq_lookup_id, "RFQ ID"))
-
-            if not quote_summary_df.empty:
-                q = quote_summary_df.iloc[0]
-
-                section("RFQ Quote Output", "💰")
-
-                quote_cols = st.columns(5)
-
-                with quote_cols[0]:
-                    kpi_card(
-                        "Baseline Cost",
-                        money(q.get("BASELINE_TOTAL_COST_USD", 0)),
-                        "Deterministic Layer 1 cost",
-                        "rgba(99,230,255,0.22)",
-                    )
-
-                with quote_cols[1]:
-                    kpi_card(
-                        "Risk-Adjusted Cost",
-                        money(q.get("RISK_ADJUSTED_TOTAL_COST_USD", 0)),
-                        "CSS + FMIS + TDS cost",
-                        "rgba(255,143,171,0.20)",
-                    )
-
-                with quote_cols[2]:
-                    kpi_card(
-                        "Risk Uplift",
-                        money(q.get("TOTAL_RISK_UPLIFT_USD", 0)),
-                        f"{as_float(q.get('TOTAL_RISK_UPLIFT_PCT', 0)):.2f}% above baseline",
-                        "rgba(255,209,102,0.22)",
-                    )
-
-                with quote_cols[3]:
-                    kpi_card(
-                        "Quote Trust",
-                        str(q.get("QUOTE_TRUST_STATUS", "N/A")),
-                        str(q.get("BMCS_REVIEW_STATUS", "N/A")),
-                        "rgba(126,247,196,0.18)",
-                    )
-
-                with quote_cols[4]:
-                    kpi_card(
-                        "Final BMCS",
-                        f"{as_float(q.get('BOM_MATCH_CONFIDENCE_SCORE', 0)):.2f}%",
-                        str(q.get("BMCS_ASSESSMENT_METHOD", "N/A")),
-                        "rgba(177,151,252,0.20)",
-                    )
-
-                st.dataframe(
-                    format_table_money(
-                        quote_summary_df,
-                        [
-                            "BASELINE_TOTAL_COST_USD",
-                            "RISK_ADJUSTED_TOTAL_COST_USD",
-                            "TOTAL_RISK_UPLIFT_USD",
-                        ],
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                note("No RFQ quote output found yet. Run the full RFQ quote pipeline.", "soft")
 
             rfq_detail_tabs = st.tabs([
                 "📌 Summary",
@@ -4350,12 +5623,6 @@ with main_tabs[0]:
 
                 st.markdown("#### RFQ Complexity Reason")
                 st.write(r.get("RFQ_COMPLEXITY_REASON", ""))
-
-                st.markdown("#### Cortex BMCS Reasoning")
-                st.write(r.get("CORTEX_BMCS_REASONING", ""))
-
-                st.markdown("#### Cortex BMCS Review Status")
-                st.write(r.get("CORTEX_BMCS_REVIEW_STATUS", ""))
 
                 st.markdown("#### Cortex Extraction Scores")
                 st.json(r.get("CORTEX_EXTRACTION_SCORES"))
@@ -4423,14 +5690,10 @@ with main_tabs[0]:
             
                 st.markdown("#### BMCS / Trust Gate")
                 bmcs_fields = [
-                    "RULE_BASED_BMCS_SCORE",
-                    "CORTEX_BMCS_SCORE",
                     "BOM_MATCH_CONFIDENCE_SCORE",
-                    "CORTEX_BMCS_REVIEW_STATUS",
                     "REVIEW_STATUS",
                     "REVIEW_REQUIRED_FLAG",
                     "FINAL_TRUSTED_COST_ALLOWED_FLAG",
-                    "FINAL_BMCS_METHOD",
                     "BMCS_RISK_LEVEL",
                     "RULE_VALIDATION_STATUS",
                 ]
@@ -4454,3 +5717,648 @@ with main_tabs[0]:
 
     except Exception as exc:
         st.error(f"Unable to load RFQ Cortex status: {exc}")
+
+# -----------------------------
+# Tab 10: Monitoring and Outcomes
+# -----------------------------
+
+with main_tabs[9]:
+    section("Monitoring and Actual-Outcome Feedback", "📈")
+    st.markdown(
+        '<div class="tab-subtitle">'
+        'Record verified realised outcomes, compare rule and ML '
+        'performance, and snapshot operational safety metrics. '
+        'Feedback remains advisory and does not change official cost. The UI displays the authenticated Snowflake user for all operator actions.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    operational_df = load_phase11a_operational_summary()
+
+    if not operational_df.empty:
+        operational_row = operational_df.iloc[0]
+        monitor_cols = st.columns(5)
+
+        with monitor_cols[0]:
+            kpi_card(
+                "Simulations",
+                str(
+                    int(
+                        as_float(
+                            operational_row.get(
+                                "TOTAL_SIMULATION_COUNT",
+                                0,
+                            )
+                        )
+                    )
+                ),
+                "Phase 10B monitored runs",
+                "rgba(99,230,255,0.20)",
+            )
+
+        with monitor_cols[1]:
+            kpi_card(
+                "Safety Failures",
+                str(
+                    int(
+                        as_float(
+                            operational_row.get(
+                                "SAFETY_FAILURE_COUNT",
+                                0,
+                            )
+                        )
+                    )
+                ),
+                "Expected zero",
+                (
+                    "rgba(126,247,196,0.22)"
+                    if as_float(
+                        operational_row.get(
+                            "SAFETY_FAILURE_COUNT",
+                            0,
+                        )
+                    ) == 0
+                    else "rgba(255,143,171,0.24)"
+                ),
+            )
+
+        with monitor_cols[2]:
+            kpi_card(
+                "Blocked Contracts",
+                str(
+                    int(
+                        as_float(
+                            operational_row.get(
+                                "COST_BLOCKED_COUNT",
+                                0,
+                            )
+                        )
+                    )
+                ),
+                "Expected zero",
+                (
+                    "rgba(126,247,196,0.22)"
+                    if as_float(
+                        operational_row.get(
+                            "COST_BLOCKED_COUNT",
+                            0,
+                        )
+                    ) == 0
+                    else "rgba(255,143,171,0.24)"
+                ),
+            )
+
+        with monitor_cols[3]:
+            kpi_card(
+                "Recalculation Required",
+                str(
+                    int(
+                        as_float(
+                            operational_row.get(
+                                "RECALC_REQUIRED_COUNT",
+                                0,
+                            )
+                        )
+                    )
+                ),
+                "Prevents stale official cost",
+                (
+                    "rgba(126,247,196,0.22)"
+                    if as_float(
+                        operational_row.get(
+                            "RECALC_REQUIRED_COUNT",
+                            0,
+                        )
+                    ) == 0
+                    else "rgba(255,209,102,0.24)"
+                ),
+            )
+
+        with monitor_cols[4]:
+            kpi_card(
+                "Cost Outcome Coverage",
+                (
+                    "—"
+                    if is_missing(
+                        operational_row.get(
+                            "COST_ACTUAL_COVERAGE_PCT"
+                        )
+                    )
+                    else (
+                        f"{as_float(operational_row.get('COST_ACTUAL_COVERAGE_PCT')):.1f}%"
+                    )
+                ),
+                "Verified realised costs",
+                "rgba(177,151,252,0.22)",
+            )
+
+    snapshot_cols = st.columns([1.2, 1.2, 1.0])
+    with snapshot_cols[0]:
+        monitoring_actor = st.text_input(
+            "Monitoring operator",
+            value=actual_snowflake_user,
+            disabled=True,
+            key="phase11a_monitoring_actor",
+            help=(
+                "The UI uses the authenticated Snowflake user rather "
+                "than a caller-entered actor name."
+            ),
+        )
+    with snapshot_cols[1]:
+        monitoring_run_id = st.text_input(
+            "Monitoring run ID",
+            value=f"MONITOR_{utc_stamp()}",
+            key="phase11a_monitoring_run_id",
+        )
+    with snapshot_cols[2]:
+        st.write("")
+        st.write("")
+        run_monitoring_clicked = st.button(
+            "Run Monitoring Snapshot",
+            type="primary",
+            use_container_width=True,
+            key="phase11a_run_monitoring",
+        )
+
+    if run_monitoring_clicked:
+        try:
+            monitoring_result = run_phase11a_monitoring(
+                monitoring_run_id,
+                monitoring_actor,
+            )
+            st.session_state[
+                "last_phase11a_monitoring_result"
+            ] = monitoring_result
+
+            if monitoring_result.get("status") == "SUCCESS":
+                note(
+                    "Monitoring snapshot completed. "
+                    f"Run status: "
+                    f"{monitoring_result.get('run_status', 'N/A')}.",
+                    "success",
+                )
+            else:
+                note(
+                    "Monitoring snapshot failed: "
+                    f"{monitoring_result}",
+                    "warning",
+                )
+        except Exception as exc:
+            note(
+                f"Monitoring snapshot failed: {exc}",
+                "warning",
+            )
+
+    dashboard_df = load_phase11a_dashboard()
+
+    section("Current Monitoring Alerts", "🚨")
+    if dashboard_df.empty:
+        note(
+            "No monitoring metrics are available.",
+            "soft",
+        )
+    else:
+        st.dataframe(
+            dashboard_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    section("Domain Performance Summary", "📊")
+    domain_summary_df = load_phase11a_domain_summary()
+    if domain_summary_df.empty:
+        note(
+            "No model-domain monitoring summary is available.",
+            "soft",
+        )
+    else:
+        st.dataframe(
+            domain_summary_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    section("Record Verified Model Outcome", "✅")
+    history_for_feedback = load_history(250)
+    feedback_simulation_ids = (
+        list(
+            dict.fromkeys(
+                history_for_feedback["SIMULATION_ID"]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+        )
+        if not history_for_feedback.empty
+        else []
+    )
+
+    if not feedback_simulation_ids:
+        note(
+            "No simulation is available for feedback entry.",
+            "soft",
+        )
+    else:
+        with st.form(
+            "phase11a_model_outcome_form",
+            clear_on_submit=False,
+        ):
+            model_form_cols = st.columns(4)
+
+            with model_form_cols[0]:
+                feedback_simulation_id = st.selectbox(
+                    "Simulation",
+                    feedback_simulation_ids,
+                    key="phase11a_model_feedback_sim",
+                )
+
+            with model_form_cols[1]:
+                feedback_domain = st.selectbox(
+                    "Model domain",
+                    ["CSS", "FMIS", "TDS", "BMCS"],
+                    key="phase11a_feedback_domain",
+                )
+
+            with model_form_cols[2]:
+                feedback_outcome_date = st.date_input(
+                    "Outcome date",
+                    key="phase11a_model_outcome_date",
+                )
+
+            with model_form_cols[3]:
+                feedback_actor = st.text_input(
+                    "Recorded by",
+                    value=actual_snowflake_user,
+                    disabled=True,
+                    key="phase11a_model_actor",
+                    help=(
+                        "The authenticated Snowflake user is recorded "
+                        "for this UI action."
+                    ),
+                )
+
+            domain_defaults = {
+                "CSS": 0.06,
+                "FMIS": 1.05,
+                "TDS": 1.40,
+                "BMCS": 1.0,
+            }
+
+            if feedback_domain == "BMCS":
+                mapping_result = st.selectbox(
+                    "Was the KMAT mapping correct?",
+                    ["Correct", "Incorrect"],
+                    key="phase11a_bmcs_mapping_result",
+                )
+                feedback_numeric_value = None
+                feedback_mapping_flag = (
+                    mapping_result == "Correct"
+                )
+                feedback_text_status = (
+                    "CORRECT_MAPPING"
+                    if feedback_mapping_flag
+                    else "INCORRECT_MAPPING"
+                )
+            else:
+                feedback_numeric_value = st.number_input(
+                    "Verified actual numeric value",
+                    min_value=0.0,
+                    value=float(
+                        domain_defaults[feedback_domain]
+                    ),
+                    step=0.01,
+                    format="%.6f",
+                    key="phase11a_model_numeric_value",
+                )
+                feedback_mapping_flag = None
+                feedback_text_status = st.text_input(
+                    "Actual status or label",
+                    value="VERIFIED_ACTUAL",
+                    key="phase11a_model_text_status",
+                )
+
+            feedback_source = st.selectbox(
+                "Outcome source",
+                [
+                    "ENGINEERING_ACTUAL",
+                    "QUALITY_ACTUAL",
+                    "ERP_ACTUAL",
+                    "SUPPLIER_ACTUAL",
+                    "ENGINEER_REVIEW",
+                    "MANUAL_VALIDATION",
+                ],
+                key="phase11a_model_source",
+            )
+
+            feedback_evidence = st.text_input(
+                "Evidence reference",
+                value="",
+                key="phase11a_model_evidence",
+            )
+
+            feedback_notes = st.text_area(
+                "Outcome notes",
+                value="",
+                key="phase11a_model_notes",
+            )
+
+            model_submit = st.form_submit_button(
+                "Record Model Outcome",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if model_submit:
+            outcome_id = (
+                f"{feedback_domain}_ACTUAL_"
+                f"{feedback_simulation_id}_"
+                f"{utc_stamp()}"
+            )
+            try:
+                model_outcome_result = (
+                    record_model_actual_outcome(
+                        outcome_id=outcome_id,
+                        simulation_id=feedback_simulation_id,
+                        model_domain=feedback_domain,
+                        outcome_date=feedback_outcome_date,
+                        actual_numeric_value=(
+                            feedback_numeric_value
+                        ),
+                        actual_text_status=(
+                            feedback_text_status
+                        ),
+                        actual_mapping_correct_flag=(
+                            feedback_mapping_flag
+                        ),
+                        outcome_source=feedback_source,
+                        evidence_reference=feedback_evidence,
+                        notes=feedback_notes,
+                        recorded_by=feedback_actor,
+                    )
+                )
+
+                if (
+                    model_outcome_result.get("status")
+                    == "SUCCESS"
+                ):
+                    note(
+                        f"Recorded {feedback_domain} actual "
+                        f"outcome for {feedback_simulation_id}.",
+                        "success",
+                    )
+                else:
+                    note(
+                        "Model outcome was not recorded: "
+                        f"{model_outcome_result}",
+                        "warning",
+                    )
+            except Exception as exc:
+                note(
+                    f"Model outcome entry failed: {exc}",
+                    "warning",
+                )
+
+        section("Record Verified Realised Cost", "💰")
+
+        with st.form(
+            "phase11a_cost_outcome_form",
+            clear_on_submit=False,
+        ):
+            cost_form_cols = st.columns(3)
+
+            with cost_form_cols[0]:
+                cost_feedback_simulation = st.selectbox(
+                    "Cost simulation",
+                    feedback_simulation_ids,
+                    key="phase11a_cost_feedback_sim",
+                )
+
+            with cost_form_cols[1]:
+                cost_outcome_date = st.date_input(
+                    "Cost outcome date",
+                    key="phase11a_cost_outcome_date",
+                )
+
+            with cost_form_cols[2]:
+                cost_feedback_actor = st.text_input(
+                    "Cost recorded by",
+                    value=actual_snowflake_user,
+                    disabled=True,
+                    key="phase11a_cost_actor",
+                    help=(
+                        "The authenticated Snowflake user is recorded "
+                        "for this UI action."
+                    ),
+                )
+
+            cost_value_cols = st.columns(3)
+
+            with cost_value_cols[0]:
+                actual_total_cost = st.number_input(
+                    "Actual total cost (USD)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=100.0,
+                    key="phase11a_actual_total_cost",
+                )
+
+            with cost_value_cols[1]:
+                actual_final_price = st.number_input(
+                    "Actual final price (USD)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=100.0,
+                    key="phase11a_actual_final_price",
+                )
+
+            with cost_value_cols[2]:
+                cost_source = st.selectbox(
+                    "Cost source",
+                    [
+                        "ERP_ACTUAL",
+                        "FINANCE_ACTUAL",
+                        "SUPPLIER_ACTUAL",
+                        "MANUAL_VALIDATION",
+                    ],
+                    key="phase11a_cost_source",
+                )
+
+            with st.expander(
+                "Optional realised cost breakdown",
+                expanded=False,
+            ):
+                breakdown_cols = st.columns(4)
+                with breakdown_cols[0]:
+                    actual_material_cost = st.number_input(
+                        "Material",
+                        min_value=0.0,
+                        value=0.0,
+                        step=100.0,
+                        key="phase11a_actual_material",
+                    )
+                with breakdown_cols[1]:
+                    actual_labor_cost = st.number_input(
+                        "Labor",
+                        min_value=0.0,
+                        value=0.0,
+                        step=50.0,
+                        key="phase11a_actual_labor",
+                    )
+                with breakdown_cols[2]:
+                    actual_machine_cost = st.number_input(
+                        "Machine",
+                        min_value=0.0,
+                        value=0.0,
+                        step=50.0,
+                        key="phase11a_actual_machine",
+                    )
+                with breakdown_cols[3]:
+                    actual_overhead_cost = st.number_input(
+                        "Overhead",
+                        min_value=0.0,
+                        value=0.0,
+                        step=50.0,
+                        key="phase11a_actual_overhead",
+                    )
+
+            cost_evidence = st.text_input(
+                "Cost evidence reference",
+                value="",
+                key="phase11a_cost_evidence",
+            )
+
+            cost_notes = st.text_area(
+                "Cost outcome notes",
+                value="",
+                key="phase11a_cost_notes",
+            )
+
+            cost_submit = st.form_submit_button(
+                "Record Realised Cost",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if cost_submit:
+            if actual_total_cost <= 0:
+                note(
+                    "Actual total cost must be greater than zero "
+                    "before recording the realised cost.",
+                    "warning",
+                )
+            else:
+                cost_outcome_id = (
+                    f"COST_ACTUAL_"
+                    f"{cost_feedback_simulation}_"
+                    f"{utc_stamp()}"
+                )
+
+                try:
+                    cost_outcome_result = (
+                        record_cost_actual_outcome(
+                            cost_outcome_id=(
+                                cost_outcome_id
+                            ),
+                            simulation_id=(
+                                cost_feedback_simulation
+                            ),
+                            outcome_date=cost_outcome_date,
+                            actual_material_cost=(
+                                actual_material_cost
+                                if actual_material_cost > 0
+                                else None
+                            ),
+                            actual_labor_cost=(
+                                actual_labor_cost
+                                if actual_labor_cost > 0
+                                else None
+                            ),
+                            actual_machine_cost=(
+                                actual_machine_cost
+                                if actual_machine_cost > 0
+                                else None
+                            ),
+                            actual_overhead_cost=(
+                                actual_overhead_cost
+                                if actual_overhead_cost > 0
+                                else None
+                            ),
+                            actual_total_cost=(
+                                actual_total_cost
+                            ),
+                            actual_final_price=(
+                                actual_final_price
+                                if actual_final_price > 0
+                                else None
+                            ),
+                            outcome_source=cost_source,
+                            evidence_reference=cost_evidence,
+                            notes=cost_notes,
+                            recorded_by=cost_feedback_actor,
+                        )
+                    )
+
+                    if (
+                        cost_outcome_result.get("status")
+                        == "SUCCESS"
+                    ):
+                        note(
+                            f"Recorded realised cost for "
+                            f"{cost_feedback_simulation}.",
+                            "success",
+                        )
+                    else:
+                        note(
+                            "Realised cost was not recorded: "
+                            f"{cost_outcome_result}",
+                            "warning",
+                        )
+                except Exception as exc:
+                    note(
+                        f"Cost outcome entry failed: {exc}",
+                        "warning",
+                    )
+
+        section("Simulation Feedback Detail", "🔬")
+        feedback_detail_sim = st.selectbox(
+            "Feedback detail simulation",
+            feedback_simulation_ids,
+            key="phase11a_feedback_detail_sim",
+        )
+
+        model_feedback_df = load_phase11a_model_feedback(
+            feedback_detail_sim
+        )
+        cost_feedback_df = load_phase11a_cost_feedback(
+            feedback_detail_sim
+        )
+
+        feedback_tabs = st.tabs(
+            [
+                "Model Feedback",
+                "Cost Feedback",
+                "Monitoring Runs",
+            ]
+        )
+
+        with feedback_tabs[0]:
+            st.dataframe(
+                model_feedback_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with feedback_tabs[1]:
+            st.dataframe(
+                cost_feedback_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with feedback_tabs[2]:
+            monitoring_runs_df = load_phase11a_runs(50)
+            st.dataframe(
+                monitoring_runs_df,
+                use_container_width=True,
+                hide_index=True,
+            )
