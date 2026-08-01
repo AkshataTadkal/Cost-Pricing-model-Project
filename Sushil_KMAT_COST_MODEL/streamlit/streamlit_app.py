@@ -1,6 +1,7 @@
 import json
 import re
 import os
+from dataclasses import dataclass
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,27 +33,253 @@ from snowflake.snowpark.context import get_active_session
 # - Corrected approved-override precedence through the V2 view.
 # ============================================================
 
-DB_NAME = "KMAT_COST_MODEL_DB"
-KMAT_ID = "KMAT_TRUCK_01"
+session = get_active_session()
+
+DEVELOPMENT_DATABASE_FALLBACK = "KMAT_COST_MODEL_DB"
+
+
+@dataclass(frozen=True)
+class RuntimeNamespace:
+    database_name: str
+    input_schema: str
+    output_schema: str
+    internal_schema: str
+    ml_schema: str
+    rfq_stage_name: str
+    kmat_id: str
+    resolution_mode: str
+    config_loaded_flag: bool
+
+    @property
+    def input_namespace(self) -> str:
+        return f"{self.database_name}.{self.input_schema}"
+
+    @property
+    def output_namespace(self) -> str:
+        return f"{self.database_name}.{self.output_schema}"
+
+    @property
+    def internal_namespace(self) -> str:
+        return f"{self.database_name}.{self.internal_schema}"
+
+    @property
+    def ml_namespace(self) -> str:
+        return f"{self.database_name}.{self.ml_schema}"
+
+    @property
+    def rfq_stage_fqn(self) -> str:
+        return (
+            f"{self.database_name}."
+            f"{self.input_schema}."
+            f"{self.rfq_stage_name}"
+        )
+
+
+def _row_value(row, key: str, index: int = 0):
+    for candidate in (key, key.upper(), key.lower()):
+        try:
+            return row[candidate]
+        except Exception:
+            pass
+    try:
+        return row[index]
+    except Exception:
+        return None
+
+
+def _safe_identifier(value, fallback: str) -> str:
+    cleaned = str(value or "").strip().upper()
+    if re.fullmatch(r"[A-Z_][A-Z0-9_$]*", cleaned):
+        return cleaned
+    return fallback
+
+
+def _current_database_name() -> str:
+    try:
+        rows = session.sql(
+            "SELECT CURRENT_DATABASE()::VARCHAR AS DATABASE_NAME"
+        ).collect()
+        if rows:
+            value = _row_value(rows[0], "DATABASE_NAME", 0)
+            return _safe_identifier(
+                value,
+                DEVELOPMENT_DATABASE_FALLBACK,
+            )
+    except Exception:
+        pass
+    return DEVELOPMENT_DATABASE_FALLBACK
+
+
+def _load_namespace_config_rows(
+    database_name: str,
+):
+    """
+    Read the namespace contract from a candidate database.
+
+    A Streamlit object can be created in a personal database such as
+    USER$<username>. That database is not automatically the KMAT data
+    database, so CURRENT_DATABASE() cannot be trusted as the only
+    bootstrap source.
+    """
+    candidate_database = _safe_identifier(
+        database_name,
+        DEVELOPMENT_DATABASE_FALLBACK,
+    )
+    bootstrap_object = (
+        f"{candidate_database}.CORE_ML."
+        "NATIVE_COMPAT_RUNTIME_NAMESPACE_V1"
+    )
+
+    try:
+        return session.sql(f"""
+            SELECT CONFIG_KEY, CONFIG_VALUE
+            FROM {bootstrap_object}
+            WHERE ACTIVE_FLAG = TRUE
+        """).collect()
+    except Exception:
+        return []
+
+
+def _load_runtime_namespace() -> RuntimeNamespace:
+    current_database = _current_database_name()
+
+    defaults = {
+        # Standalone Streamlit deployments must use the known KMAT
+        # database unless a namespace contract is present in the
+        # Streamlit object's own database.
+        "DATABASE_RESOLUTION_MODE": (
+            "DEVELOPMENT_DATABASE_FALLBACK"
+        ),
+        "DEVELOPMENT_DATABASE_FALLBACK": (
+            DEVELOPMENT_DATABASE_FALLBACK
+        ),
+        "INPUT_SCHEMA": "CORE_INPUT",
+        "OUTPUT_SCHEMA": "CORE_OUTPUT",
+        "INTERNAL_SCHEMA": "CORE_INTERNAL",
+        "ML_SCHEMA": "CORE_ML",
+        "RFQ_STAGE_NAME": "RFQ_DOC_STAGE",
+        "DEFAULT_KMAT_ID": "KMAT_TRUCK_01",
+    }
+
+    config_loaded = False
+    config_source_database = None
+    rows = []
+
+    candidate_databases = [current_database]
+    if current_database != DEVELOPMENT_DATABASE_FALLBACK:
+        candidate_databases.append(
+            DEVELOPMENT_DATABASE_FALLBACK
+        )
+
+    for candidate_database in candidate_databases:
+        candidate_rows = _load_namespace_config_rows(
+            candidate_database
+        )
+        if candidate_rows:
+            rows = candidate_rows
+            config_source_database = candidate_database
+            config_loaded = True
+            break
+
+    for row in rows:
+        key = str(
+            _row_value(row, "CONFIG_KEY", 0) or ""
+        ).upper()
+        value = str(
+            _row_value(row, "CONFIG_VALUE", 1) or ""
+        ).strip()
+
+        if key in defaults and value:
+            defaults[key] = value
+
+    configured_fallback_database = _safe_identifier(
+        defaults["DEVELOPMENT_DATABASE_FALLBACK"],
+        DEVELOPMENT_DATABASE_FALLBACK,
+    )
+
+    requested_resolution_mode = str(
+        defaults["DATABASE_RESOLUTION_MODE"]
+    ).strip().upper()
+
+    use_current_database = (
+        requested_resolution_mode == "CURRENT_DATABASE"
+        and config_loaded
+        and config_source_database == current_database
+    )
+
+    if use_current_database:
+        database_name = current_database
+        effective_resolution_mode = "CURRENT_DATABASE"
+    else:
+        database_name = configured_fallback_database
+        effective_resolution_mode = (
+            "DEVELOPMENT_DATABASE_FALLBACK"
+        )
+
+    return RuntimeNamespace(
+        database_name=_safe_identifier(
+            database_name,
+            DEVELOPMENT_DATABASE_FALLBACK,
+        ),
+        input_schema=_safe_identifier(
+            defaults["INPUT_SCHEMA"],
+            "CORE_INPUT",
+        ),
+        output_schema=_safe_identifier(
+            defaults["OUTPUT_SCHEMA"],
+            "CORE_OUTPUT",
+        ),
+        internal_schema=_safe_identifier(
+            defaults["INTERNAL_SCHEMA"],
+            "CORE_INTERNAL",
+        ),
+        ml_schema=_safe_identifier(
+            defaults["ML_SCHEMA"],
+            "CORE_ML",
+        ),
+        rfq_stage_name=_safe_identifier(
+            defaults["RFQ_STAGE_NAME"],
+            "RFQ_DOC_STAGE",
+        ),
+        kmat_id=str(
+            defaults["DEFAULT_KMAT_ID"]
+        ).strip().upper() or "KMAT_TRUCK_01",
+        resolution_mode=effective_resolution_mode,
+        config_loaded_flag=config_loaded,
+    )
+
+
+RUNTIME_NAMESPACE = _load_runtime_namespace()
+
+DB_NAME = RUNTIME_NAMESPACE.database_name
+INPUT_NS = RUNTIME_NAMESPACE.input_namespace
+OUTPUT_NS = RUNTIME_NAMESPACE.output_namespace
+INTERNAL_NS = RUNTIME_NAMESPACE.internal_namespace
+ML_NS = RUNTIME_NAMESPACE.ml_namespace
+RFQ_DOCUMENT_STAGE_NAME = RUNTIME_NAMESPACE.rfq_stage_fqn
+KMAT_ID = RUNTIME_NAMESPACE.kmat_id
 
 SECURE_ACTIVATION_ENTRY_POINT = (
-    f"{DB_NAME}.CORE_ML."
-    "ACTIVATE_APPROVED_ML_DEPLOYMENT_SECURE_V1"
+    f"{ML_NS}.ACTIVATE_APPROVED_ML_DEPLOYMENT_SECURE_V1"
 )
 SECURE_RUNTIME_RESOLVER = (
-    f"{DB_NAME}.CORE_ML."
-    "RESOLVE_ML_RUNTIME_AUTHORITY_SECURE_V1"
+    f"{ML_NS}.RESOLVE_ML_RUNTIME_AUTHORITY_SECURE_V1"
 )
 SECURE_OVERRIDE_SUBMIT = (
-    f"{DB_NAME}.CORE_ML."
-    "SUBMIT_ML_DECISION_OVERRIDE_V2"
+    f"{ML_NS}.SUBMIT_ML_DECISION_OVERRIDE_V2"
 )
 SECURE_OVERRIDE_REVIEW = (
-    f"{DB_NAME}.CORE_ML."
-    "REVIEW_ML_DECISION_OVERRIDE_V2"
+    f"{ML_NS}.REVIEW_ML_DECISION_OVERRIDE_V2"
 )
 
-session = get_active_session()
+# Phase 14B Native App compatibility boundary:
+# - no Streamlit cache decorators;
+# - no browser file uploader;
+# - no page configuration call;
+# - no internet-hosted fonts;
+# - CSV downloads require Streamlit 1.26 or later.
+NATIVE_APP_COMPATIBILITY_MODE = True
+MIN_STREAMLIT_VERSION_FOR_DOWNLOAD = (1, 26, 0)
 
 
 # -----------------------------
@@ -202,14 +429,13 @@ def make_runtime_decision_id(
 # Backend access functions
 # -----------------------------
 
-@st.cache_data(ttl=60)
-def load_allowed_values_cached() -> Dict[str, List[str]]:
+def load_allowed_values() -> Dict[str, List[str]]:
     df = query_df(f"""
         SELECT
             CHARACTERISTIC_NAME,
             ALLOWED_VALUE,
             DISPLAY_ORDER
-        FROM {DB_NAME}.CORE_INPUT.CHARACTERISTIC_MASTER
+        FROM {INPUT_NS}.CHARACTERISTIC_MASTER
         WHERE KMAT_ID = {sql_literal(KMAT_ID)}
           AND ACTIVE_FLAG = TRUE
         ORDER BY DISPLAY_ORDER, ALLOWED_VALUE
@@ -229,21 +455,21 @@ def load_allowed_values_cached() -> Dict[str, List[str]]:
 
 def clear_simulation_inputs(simulation_id: str):
     sim_lit = sql_literal(simulation_id)
-    run_sql(f"DELETE FROM {DB_NAME}.CORE_INPUT.CHARACTERISTIC_VALUES WHERE SIMULATION_ID = {sim_lit}")
-    run_sql(f"DELETE FROM {DB_NAME}.CORE_INPUT.SIMULATION_PARAMETERS WHERE SIMULATION_ID = {sim_lit}")
+    run_sql(f"DELETE FROM {INPUT_NS}.CHARACTERISTIC_VALUES WHERE SIMULATION_ID = {sim_lit}")
+    run_sql(f"DELETE FROM {INPUT_NS}.SIMULATION_PARAMETERS WHERE SIMULATION_ID = {sim_lit}")
 
     # Phase 5A production context is used by FMIS to choose the forecast month.
     try:
-        run_sql(f"DELETE FROM {DB_NAME}.CORE_INPUT.SIMULATION_PRODUCTION_CONTEXT WHERE SIMULATION_ID = {sim_lit}")
+        run_sql(f"DELETE FROM {INPUT_NS}.SIMULATION_PRODUCTION_CONTEXT WHERE SIMULATION_ID = {sim_lit}")
     except Exception:
         pass
 
-    run_sql(f"DELETE FROM {DB_NAME}.CORE_INPUT.SIMULATION_HEADER WHERE SIMULATION_ID = {sim_lit}")
+    run_sql(f"DELETE FROM {INPUT_NS}.SIMULATION_HEADER WHERE SIMULATION_ID = {sim_lit}")
 
     # This table exists only if the user completed the optional Phase 3 component-adjustment enhancement.
     # Ignore failure if it does not exist.
     try:
-        run_sql(f"DELETE FROM {DB_NAME}.CORE_INPUT.COMPONENT_COST_ADJUSTMENTS WHERE SIMULATION_ID = {sim_lit}")
+        run_sql(f"DELETE FROM {INPUT_NS}.COMPONENT_COST_ADJUSTMENTS WHERE SIMULATION_ID = {sim_lit}")
     except Exception:
         pass
 
@@ -270,7 +496,7 @@ def reset_and_insert_simulation(
     sim_lit = sql_literal(simulation_id)
 
     run_sql(f"""
-        INSERT INTO {DB_NAME}.CORE_INPUT.SIMULATION_HEADER
+        INSERT INTO {INPUT_NS}.SIMULATION_HEADER
         (SIMULATION_ID, KMAT_ID, CUSTOMER_ID, SCENARIO_NAME)
         VALUES
         (
@@ -288,14 +514,14 @@ def reset_and_insert_simulation(
         )
 
     run_sql(f"""
-        INSERT INTO {DB_NAME}.CORE_INPUT.CHARACTERISTIC_VALUES
+        INSERT INTO {INPUT_NS}.CHARACTERISTIC_VALUES
         (SIMULATION_ID, KMAT_ID, CHARACTERISTIC_NAME, SELECTED_VALUE)
         VALUES
         {", ".join(value_rows)}
     """)
 
     run_sql(f"""
-        INSERT INTO {DB_NAME}.CORE_INPUT.SIMULATION_PARAMETERS
+        INSERT INTO {INPUT_NS}.SIMULATION_PARAMETERS
         (
             SIMULATION_ID,
             MATERIAL_COST_MULTIPLIER,
@@ -322,7 +548,7 @@ def reset_and_insert_simulation(
     # Phase 5A production context. FMIS uses the planned production month.
     planned_date_str = str(planned_production_date)
     run_sql(f"""
-        INSERT INTO {DB_NAME}.CORE_INPUT.SIMULATION_PRODUCTION_CONTEXT
+        INSERT INTO {INPUT_NS}.SIMULATION_PRODUCTION_CONTEXT
         (
             SIMULATION_ID,
             KMAT_ID,
@@ -352,7 +578,7 @@ def run_kmat_engine(simulation_id: str) -> Dict:
     different responsibilities.
     """
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_KMAT_COST_SIMULATION_GOVERNED_V3(
+        CALL {INTERNAL_NS}.RUN_KMAT_COST_SIMULATION_GOVERNED_V3(
             {sql_literal(simulation_id)}
         )
     """)
@@ -360,7 +586,6 @@ def run_kmat_engine(simulation_id: str) -> Dict:
     return parse_procedure_result(raw_result)
 
 
-@st.cache_data(ttl=30)
 def load_session_identity() -> Dict[str, Any]:
     df = query_df("""
         SELECT
@@ -384,30 +609,27 @@ def load_session_identity() -> Dict[str, Any]:
     return df.iloc[0].to_dict()
 
 
-@st.cache_data(ttl=30)
 def load_runtime_authority_dashboard() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_PHASE13A_RUNTIME_AUTHORITY_V1
         ORDER BY MODEL_DOMAIN
     """)
 
 
-@st.cache_data(ttl=30)
 def load_security_control_dashboard() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_PHASE13B_SECURITY_DASHBOARD_V1
     """)
 
 
-@st.cache_data(ttl=30)
 def load_policy_seal_integrity() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_ML_POLICY_VERSION_SEAL_INTEGRITY_V1
         ORDER BY MODEL_DOMAIN
     """)
@@ -418,7 +640,7 @@ def load_streamlit_runtime_inputs(
 ) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_STREAMLIT_RUNTIME_INPUT_V1
         WHERE SIMULATION_ID =
               {sql_literal(simulation_id)}
@@ -469,7 +691,7 @@ def load_runtime_decisions(
 
             REQUESTED_BY,
             DECIDED_AT
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_ML_RUNTIME_DECISION_CURRENT_V1
         WHERE SIMULATION_ID =
               {sql_literal(simulation_id)}
@@ -483,7 +705,7 @@ def load_approved_override_display(
 ) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_ML_DECISION_WITH_APPROVED_OVERRIDE_V2
         WHERE SIMULATION_ID =
               {sql_literal(simulation_id)}
@@ -785,7 +1007,7 @@ def prepare_governance_for_existing_simulation(
     not overwrite the RFQ pipeline's final BMCS trust patch.
     """
     phase10a_rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_ML.PREPARE_KMAT_GOVERNED_COST_INPUT_V2(
+        CALL {ML_NS}.PREPARE_KMAT_GOVERNED_COST_INPUT_V2(
             {sql_literal(simulation_id)}
         )
     """)
@@ -802,7 +1024,7 @@ def prepare_governance_for_existing_simulation(
         }
 
     phase10b_rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_ML.RESOLVE_KMAT_COST_FACTOR_HIERARCHY_V1(
+        CALL {ML_NS}.RESOLVE_KMAT_COST_FACTOR_HIERARCHY_V1(
             {sql_literal(simulation_id)}
         )
     """)
@@ -916,7 +1138,7 @@ def load_summary(simulation_id: str) -> pd.DataFrame:
             BMCS_ASSESSMENT_NOTES,
 
             CALCULATED_AT
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COST_SUMMARY
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COST_SUMMARY
         WHERE SIMULATION_ID = {sql_literal(simulation_id)}
     """)
 
@@ -926,7 +1148,7 @@ def load_phase10c_decision_display(
 ) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML.VW_KMAT_PHASE10C_DECISION_DISPLAY_V1
+        FROM {ML_NS}.VW_KMAT_PHASE10C_DECISION_DISPLAY_V1
         WHERE SIMULATION_ID = {sql_literal(simulation_id)}
     """)
 
@@ -975,7 +1197,7 @@ def load_phase10c_audit(
 
                 AUDITED_BY AS EVENT_ACTOR,
                 AUDITED_AT AS EVENT_AT
-            FROM {DB_NAME}.CORE_ML.KMAT_GOVERNED_COST_INPUT_AUDIT_V2
+            FROM {ML_NS}.KMAT_GOVERNED_COST_INPUT_AUDIT_V2
             WHERE SIMULATION_ID = {sql_literal(simulation_id)}
 
             UNION ALL
@@ -1001,7 +1223,7 @@ def load_phase10c_audit(
 
                 AUDITED_BY AS EVENT_ACTOR,
                 AUDITED_AT AS EVENT_AT
-            FROM {DB_NAME}.CORE_ML.KMAT_COST_FACTOR_RESOLUTION_AUDIT_V1
+            FROM {ML_NS}.KMAT_COST_FACTOR_RESOLUTION_AUDIT_V1
             WHERE SIMULATION_ID = {sql_literal(simulation_id)}
         )
         ORDER BY EVENT_AT DESC
@@ -1239,7 +1461,7 @@ def record_model_actual_outcome(
     )
 
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_ML
+        CALL {ML_NS}
             .RECORD_KMAT_MODEL_ACTUAL_OUTCOME_V1(
                 {sql_literal(outcome_id)},
                 {sql_literal(simulation_id)},
@@ -1282,7 +1504,7 @@ def record_cost_actual_outcome(
         return str(float(value))
 
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_ML
+        CALL {ML_NS}
             .RECORD_KMAT_COST_ACTUAL_OUTCOME_V1(
                 {sql_literal(cost_outcome_id)},
                 {sql_literal(simulation_id)},
@@ -1312,7 +1534,7 @@ def run_phase11a_monitoring(
     run_by: str,
 ) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_ML.RUN_KMAT_MONITORING_V1(
+        CALL {ML_NS}.RUN_KMAT_MONITORING_V1(
             {sql_literal(monitoring_run_id)},
             {sql_literal(run_by)}
         )
@@ -1324,7 +1546,7 @@ def run_phase11a_monitoring(
 def load_phase11a_dashboard() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_PHASE11A_MONITORING_DASHBOARD_V1
         ORDER BY
             CASE ALERT_STATUS
@@ -1343,7 +1565,7 @@ def load_phase11a_dashboard() -> pd.DataFrame:
 def load_phase11a_domain_summary() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_MONITORING_DOMAIN_SUMMARY_V1
         ORDER BY MODEL_DOMAIN
     """)
@@ -1352,7 +1574,7 @@ def load_phase11a_domain_summary() -> pd.DataFrame:
 def load_phase11a_operational_summary() -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_MONITORING_OPERATIONAL_SUMMARY_V1
     """)
 
@@ -1362,7 +1584,7 @@ def load_phase11a_model_feedback(
 ) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_MODEL_FEEDBACK_DETAIL_V1
         WHERE SIMULATION_ID = {sql_literal(simulation_id)}
         ORDER BY MODEL_DOMAIN
@@ -1374,7 +1596,7 @@ def load_phase11a_cost_feedback(
 ) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML
+        FROM {ML_NS}
             .VW_KMAT_COST_FEEDBACK_DETAIL_V1
         WHERE SIMULATION_ID = {sql_literal(simulation_id)}
     """)
@@ -1383,7 +1605,7 @@ def load_phase11a_cost_feedback(
 def load_phase11a_runs(limit: int = 50) -> pd.DataFrame:
     return query_df(f"""
         SELECT *
-        FROM {DB_NAME}.CORE_ML.KMAT_MONITORING_RUN_V1
+        FROM {ML_NS}.KMAT_MONITORING_RUN_V1
         ORDER BY COMPLETED_AT DESC
         LIMIT {int(limit)}
     """)
@@ -1419,7 +1641,7 @@ def load_results(simulation_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
             ADJUSTED_LINE_MATERIAL_COST_USD,
             FMIS_FALLBACK_FLAG,
             RISK_ADJUSTMENT_NOTES
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COMPONENT_COSTS
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COMPONENT_COSTS
         WHERE SIMULATION_ID = {sim_lit}
         ORDER BY COST_COMPONENT_GROUP, COMPONENT_ID
     """)
@@ -1446,7 +1668,7 @@ def load_results(simulation_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
             TOOLING_ADJUSTMENT_USD,
             TDS_FALLBACK_FLAG,
             RISK_ADJUSTMENT_NOTES
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_OPERATION_COSTS
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_OPERATION_COSTS
         WHERE SIMULATION_ID = {sim_lit}
         ORDER BY OPERATION_ID
     """)
@@ -1466,7 +1688,7 @@ def load_results(simulation_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
             OVERHEAD_ADJUSTMENT_USD,
             RISK_ADJUSTED_FLAG,
             RISK_ADJUSTMENT_NOTES
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_OVERHEAD_COSTS
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_OVERHEAD_COSTS
         WHERE SIMULATION_ID = {sim_lit}
         ORDER BY OVERHEAD_ID
     """)
@@ -1482,7 +1704,7 @@ def load_history(limit: int = 100) -> pd.DataFrame:
                 KMAT_ID,
                 LISTAGG(CHARACTERISTIC_NAME || '=' || SELECTED_VALUE, ', ')
                     WITHIN GROUP (ORDER BY CHARACTERISTIC_NAME) AS CONFIGURATION
-            FROM {DB_NAME}.CORE_INPUT.CHARACTERISTIC_VALUES
+            FROM {INPUT_NS}.CHARACTERISTIC_VALUES
             WHERE KMAT_ID = {sql_literal(KMAT_ID)}
             GROUP BY SIMULATION_ID, KMAT_ID
         )
@@ -1534,16 +1756,16 @@ def load_history(limit: int = 100) -> pd.DataFrame:
 
             s.CALCULATED_AT,
             h.CREATED_AT
-        FROM {DB_NAME}.CORE_INPUT.SIMULATION_HEADER h
+        FROM {INPUT_NS}.SIMULATION_HEADER h
         LEFT JOIN cfg
             ON h.SIMULATION_ID = cfg.SIMULATION_ID
            AND h.KMAT_ID = cfg.KMAT_ID
-        LEFT JOIN {DB_NAME}.CORE_INPUT.SIMULATION_PARAMETERS p
+        LEFT JOIN {INPUT_NS}.SIMULATION_PARAMETERS p
             ON h.SIMULATION_ID = p.SIMULATION_ID
-        LEFT JOIN {DB_NAME}.CORE_INPUT.SIMULATION_PRODUCTION_CONTEXT ctx
+        LEFT JOIN {INPUT_NS}.SIMULATION_PRODUCTION_CONTEXT ctx
             ON h.SIMULATION_ID = ctx.SIMULATION_ID
            AND h.KMAT_ID = ctx.KMAT_ID
-        LEFT JOIN {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COST_SUMMARY s
+        LEFT JOIN {OUTPUT_NS}.KMAT_CONFIGURED_COST_SUMMARY s
             ON h.SIMULATION_ID = s.SIMULATION_ID
            AND h.KMAT_ID = s.KMAT_ID
         WHERE h.KMAT_ID = {sql_literal(KMAT_ID)}
@@ -1563,7 +1785,7 @@ def load_compare(simulation_ids: List[str]) -> pd.DataFrame:
                 KMAT_ID,
                 LISTAGG(CHARACTERISTIC_NAME || '=' || SELECTED_VALUE, ', ')
                     WITHIN GROUP (ORDER BY CHARACTERISTIC_NAME) AS CONFIGURATION
-            FROM {DB_NAME}.CORE_INPUT.CHARACTERISTIC_VALUES
+            FROM {INPUT_NS}.CHARACTERISTIC_VALUES
             WHERE SIMULATION_ID IN {sql_in(simulation_ids)}
             GROUP BY SIMULATION_ID, KMAT_ID
         )
@@ -1608,11 +1830,11 @@ def load_compare(simulation_ids: List[str]) -> pd.DataFrame:
             s.QUOTE_TRUST_STATUS,
 
             s.CALCULATED_AT
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COST_SUMMARY s
-        JOIN {DB_NAME}.CORE_INPUT.SIMULATION_HEADER h
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COST_SUMMARY s
+        JOIN {INPUT_NS}.SIMULATION_HEADER h
             ON s.SIMULATION_ID = h.SIMULATION_ID
            AND s.KMAT_ID = h.KMAT_ID
-        LEFT JOIN {DB_NAME}.CORE_INPUT.SIMULATION_PARAMETERS p
+        LEFT JOIN {INPUT_NS}.SIMULATION_PARAMETERS p
             ON s.SIMULATION_ID = p.SIMULATION_ID
         LEFT JOIN cfg
             ON s.SIMULATION_ID = cfg.SIMULATION_ID
@@ -1682,7 +1904,7 @@ def load_component_impact(baseline_id: str, scenario_id: str) -> pd.DataFrame:
             LINE_MATERIAL_COST_USD AS BASELINE_LINE_MATERIAL_COST_USD,
             ADJUSTED_LINE_MATERIAL_COST_USD AS BASELINE_ADJUSTED_LINE_MATERIAL_COST_USD,
             TRUE AS SELECTED_IN_BASELINE
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COMPONENT_COSTS
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COMPONENT_COSTS
         WHERE SIMULATION_ID = {sql_literal(baseline_id)}
     """)
 
@@ -1696,7 +1918,7 @@ def load_component_impact(baseline_id: str, scenario_id: str) -> pd.DataFrame:
             LINE_MATERIAL_COST_USD AS SCENARIO_LINE_MATERIAL_COST_USD,
             ADJUSTED_LINE_MATERIAL_COST_USD AS SCENARIO_ADJUSTED_LINE_MATERIAL_COST_USD,
             TRUE AS SELECTED_IN_SCENARIO
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COMPONENT_COSTS
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COMPONENT_COSTS
         WHERE SIMULATION_ID = {sql_literal(scenario_id)}
     """)
 
@@ -1766,7 +1988,7 @@ def load_rfq_bmcs_status(limit: int = 200) -> pd.DataFrame:
             ASSESSMENT_METHOD,
             ASSESSMENT_VERSION,
             ASSESSMENT_NOTES
-        FROM {DB_NAME}.CORE_INPUT.VW_RFQ_BMCS_STATUS
+        FROM {INPUT_NS}.VW_RFQ_BMCS_STATUS
         WHERE KMAT_ID = {sql_literal(KMAT_ID)}
         ORDER BY RFQ_ID
         LIMIT {int(limit)}
@@ -1785,7 +2007,7 @@ def load_rfq_scoring_detail(rfq_id: str) -> pd.DataFrame:
             MATCHED_SIGNAL_PHRASES,
             CHARACTERISTIC_SCORE_NOTES,
             CREATED_AT
-        FROM {DB_NAME}.CORE_INPUT.BMCS_SCORING_DETAIL
+        FROM {INPUT_NS}.BMCS_SCORING_DETAIL
         WHERE RFQ_ID = {sql_literal(rfq_id)}
         ORDER BY CHARACTERISTIC_NAME
     """)
@@ -1793,7 +2015,7 @@ def load_rfq_scoring_detail(rfq_id: str) -> pd.DataFrame:
 
 def run_bmcs_scoring(rfq_id: str) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_RULE_BASED_BMCS_SCORING({sql_literal(rfq_id)})
+        CALL {INTERNAL_NS}.RUN_RULE_BASED_BMCS_SCORING({sql_literal(rfq_id)})
     """)
     raw_result = rows[0][0] if rows else "{}"
     try:
@@ -1804,7 +2026,7 @@ def run_bmcs_scoring(rfq_id: str) -> Dict:
 
 def prepare_rfq_simulation_inputs(rfq_id: str) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.PREPARE_RFQ_SIMULATION_INPUTS({sql_literal(rfq_id)})
+        CALL {INTERNAL_NS}.PREPARE_RFQ_SIMULATION_INPUTS({sql_literal(rfq_id)})
     """)
     raw_result = rows[0][0] if rows else "{}"
     try:
@@ -1854,6 +2076,108 @@ def safe_filename(value: str) -> str:
     cleaned = cleaned.strip("._")
     return cleaned or "uploaded_rfq.txt"
 
+
+
+
+RFQ_SUPPORTED_DOCUMENT_TYPES = {"PDF", "DOCX", "TXT"}
+
+
+def load_available_rfq_documents() -> List[Dict[str, Any]]:
+    """
+    Return governed RFQ documents as business-friendly selector options.
+
+    Streamlit reads stage metadata only. It does not receive or upload the
+    document bytes.
+    """
+    rows = run_sql(
+        f"LIST @{RFQ_DOCUMENT_STAGE_NAME}"
+    )
+
+    def row_value(row, key: str, index: int):
+        for candidate in (key, key.upper(), key.lower()):
+            try:
+                return row[candidate]
+            except Exception:
+                pass
+        try:
+            return row[index]
+        except Exception:
+            return None
+
+    documents: List[Dict[str, Any]] = []
+
+    for row in rows:
+        staged_name = str(
+            row_value(row, "name", 0) or ""
+        ).strip()
+        if not staged_name:
+            continue
+
+        normalized_name = staged_name.replace("\\", "/")
+        document_name = normalized_name.rsplit("/", 1)[-1]
+        document_type = (
+            document_name.rsplit(".", 1)[-1].upper()
+            if "." in document_name
+            else ""
+        )
+
+        if document_type not in RFQ_SUPPORTED_DOCUMENT_TYPES:
+            continue
+
+        upper_name = normalized_name.upper()
+        stage_marker = "RFQ_DOC_STAGE/"
+        marker_position = upper_name.find(stage_marker)
+
+        if marker_position >= 0:
+            relative_path = normalized_name[
+                marker_position + len(stage_marker):
+            ]
+        else:
+            relative_path = normalized_name.lstrip("@/")
+
+        if (
+            not relative_path
+            or relative_path.startswith("/")
+            or ".." in relative_path
+            or "'" in relative_path
+        ):
+            continue
+
+        size_value = row_value(row, "size", 1)
+        modified_value = row_value(row, "last_modified", 3)
+        parent_folder = (
+            relative_path.rsplit("/", 1)[0]
+            if "/" in relative_path
+            else "Root"
+        )
+
+        documents.append(
+            {
+                "display_label": (
+                    f"{document_name}  —  {parent_folder}"
+                ),
+                "document_name": document_name,
+                "document_type": document_type,
+                "stage_name": RFQ_DOCUMENT_STAGE_NAME,
+                "relative_path": relative_path,
+                "size_bytes": size_value,
+                "last_modified": (
+                    str(modified_value)
+                    if modified_value is not None
+                    else ""
+                ),
+            }
+        )
+
+    documents.sort(
+        key=lambda item: (
+            item.get("last_modified", ""),
+            item.get("relative_path", ""),
+        ),
+        reverse=True,
+    )
+    return documents
+
 def vertical_record_table(record: Dict, fields: List[str] = None) -> pd.DataFrame:
     """
     Converts one dataframe row/dict into a vertical Field-Value table.
@@ -1883,94 +2207,6 @@ def vertical_record_table(record: Dict, fields: List[str] = None) -> pd.DataFram
 
     return pd.DataFrame(rows)
 
-def upload_rfq_file_to_stage(rfq_id: str, uploaded_file) -> Dict:
-    """
-    Uploads the Streamlit RFQ file to Snowflake internal stage and verifies the exact path.
-    The procedure later reads the same SOURCE_STAGE_RELATIVE_PATH through TO_FILE().
-    """
-    if uploaded_file is None:
-        return {
-            "uploaded": False,
-            "stage_name": None,
-            "relative_path": None,
-            "source_document_name": None,
-            "source_document_type": None,
-        }
-
-    safe_rfq_id = normalize_id(rfq_id, "RFQ ID")
-    filename = safe_filename(uploaded_file.name)
-    local_dir = f"/tmp/{safe_rfq_id}"
-    os.makedirs(local_dir, exist_ok=True)
-    local_path = f"{local_dir}/{filename}"
-
-    with open(local_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-    stage_folder = f"@{DB_NAME}.CORE_INPUT.RFQ_DOC_STAGE/{safe_rfq_id}"
-    put_result = session.file.put(
-        local_path,
-        stage_folder,
-        overwrite=True,
-        auto_compress=False,
-    )
-
-    try:
-        os.remove(local_path)
-    except Exception:
-        pass
-
-    # Verify immediately. This avoids guessing the final staged path.
-    list_rows = run_sql(f"LIST @{DB_NAME}.CORE_INPUT.RFQ_DOC_STAGE/{safe_rfq_id}")
-    if not list_rows:
-        raise RuntimeError(
-            "The RFQ file upload completed but no file was visible in RFQ_DOC_STAGE. "
-            f"PUT result: {put_result}"
-        )
-
-    staged_names = []
-    for row in list_rows:
-        try:
-            staged_names.append(str(row["name"]))
-        except Exception:
-            staged_names.append(str(row[0]))
-
-    matched_name = None
-    for staged_name in staged_names:
-        if staged_name.lower().endswith("/" + filename.lower()) or staged_name.lower().endswith(filename.lower()):
-            matched_name = staged_name
-            break
-
-    if matched_name is None:
-        raise RuntimeError(
-            "The uploaded file was not found under the expected RFQ folder. "
-            f"Expected file: {filename}. Files found: {staged_names}. PUT result: {put_result}"
-        )
-
-    upper_name = matched_name.upper()
-    upper_marker = f"RFQ_DOC_STAGE/{safe_rfq_id}/".upper()
-    if upper_marker in upper_name:
-        start_pos = upper_name.index(upper_marker) + len("RFQ_DOC_STAGE/")
-        relative_path = matched_name[start_pos:]
-    else:
-        folder_marker = f"{safe_rfq_id}/"
-        upper_folder_marker = folder_marker.upper()
-        if upper_folder_marker in upper_name:
-            start_pos = upper_name.index(upper_folder_marker)
-            relative_path = matched_name[start_pos:]
-        else:
-            relative_path = f"{safe_rfq_id}/{filename}"
-
-    extension = filename.split(".")[-1].upper() if "." in filename else "UNKNOWN"
-
-    return {
-        "uploaded": True,
-        "stage_name": "CORE_INPUT.RFQ_DOC_STAGE",
-        "relative_path": relative_path,
-        "source_document_name": filename,
-        "source_document_type": extension,
-    }
-
-
 def upsert_rfq_header_for_cortex(
     rfq_id: str,
     customer_id: str,
@@ -1986,7 +2222,7 @@ def upsert_rfq_header_for_cortex(
     customer_id = normalize_id(customer_id, "Customer ID")
 
     run_sql(f"""
-        MERGE INTO {DB_NAME}.CORE_INPUT.RFQ_HEADER t
+        MERGE INTO {INPUT_NS}.RFQ_HEADER t
         USING (
             SELECT
                 {sql_literal(rfq_id)} AS RFQ_ID,
@@ -2053,7 +2289,7 @@ def upsert_rfq_header_for_cortex(
 
 def run_cortex_rfq_intake(rfq_id: str) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_RFQ_INTAKE_PIPELINE({sql_literal(rfq_id)})
+        CALL {INTERNAL_NS}.RUN_CORTEX_RFQ_INTAKE_PIPELINE({sql_literal(rfq_id)})
     """)
     raw_result = rows[0][0] if rows else "{}"
     try:
@@ -2064,7 +2300,7 @@ def run_cortex_rfq_intake(rfq_id: str) -> Dict:
 
 def prepare_rfq_simulation_inputs(rfq_id: str) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.PREPARE_RFQ_SIMULATION_INPUTS({sql_literal(rfq_id)})
+        CALL {INTERNAL_NS}.PREPARE_RFQ_SIMULATION_INPUTS({sql_literal(rfq_id)})
     """)
     raw_result = rows[0][0] if rows else "{}"
     try:
@@ -2074,7 +2310,7 @@ def prepare_rfq_simulation_inputs(rfq_id: str) -> Dict:
 
 def run_cortex_rfq_quote_pipeline(rfq_id: str) -> Dict:
     rows = run_sql(f"""
-        CALL {DB_NAME}.CORE_INTERNAL.RUN_CORTEX_RFQ_QUOTE_PIPELINE({sql_literal(rfq_id)})
+        CALL {INTERNAL_NS}.RUN_CORTEX_RFQ_QUOTE_PIPELINE({sql_literal(rfq_id)})
     """)
     raw_result = rows[0][0] if rows else "{}"
     try:
@@ -2124,7 +2360,7 @@ def load_rfq_cortex_status(rfq_id: str = None) -> pd.DataFrame:
             CORTEX_BMCS_REASONING,
             BMCS_RISK_LEVEL,
             RULE_VALIDATION_STATUS
-        FROM {DB_NAME}.CORE_INPUT.VW_RFQ_BMCS_STATUS
+        FROM {INPUT_NS}.VW_RFQ_BMCS_STATUS
         {where_clause}
         ORDER BY RFQ_ID
     """)
@@ -2155,7 +2391,7 @@ def load_rfq_quote_summary(rfq_id: str) -> pd.DataFrame:
             MAX_TDS_FACTOR,
 
             CALCULATED_AT
-        FROM {DB_NAME}.CORE_OUTPUT.KMAT_CONFIGURED_COST_SUMMARY
+        FROM {OUTPUT_NS}.KMAT_CONFIGURED_COST_SUMMARY
         WHERE RFQ_ID = {sql_literal(rfq_id)}
         ORDER BY CALCULATED_AT DESC
         LIMIT 1
@@ -2172,7 +2408,7 @@ def load_bmcs_scoring_detail_for_rfq(rfq_id: str) -> pd.DataFrame:
             MATCHED_SIGNAL_FLAG,
             MATCHED_SIGNAL_PHRASES,
             CHARACTERISTIC_SCORE_NOTES
-        FROM {DB_NAME}.CORE_INPUT.BMCS_SCORING_DETAIL
+        FROM {INPUT_NS}.BMCS_SCORING_DETAIL
         WHERE RFQ_ID = {sql_literal(rfq_id)}
         ORDER BY CHARACTERISTIC_NAME
     """)
@@ -2654,7 +2890,6 @@ def inject_consistent_glass_overrides():
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
 
         :root {
             --ui-bg: #07111f;
@@ -3086,7 +3321,7 @@ def render_hero():
             <h1 class="hero-title">Truck Configuration Cost Command Center</h1>
             <div class="hero-subtitle">
                 A polished Snowflake + Streamlit workspace for Cortex RFQ intake and configurable truck costing.
-                Upload customer RFQs, extract KMAT characteristics, validate BMCS trust, run the governed Snowpark engine,
+                Paste RFQ text or select available RFQ documents, extract KMAT characteristics, validate BMCS trust, run the governed Snowpark engine,
                 compare rule, ML, override, default, and final decisions, and explain baseline plus risk-adjusted cost with confidence.
                 Runtime candidate use is governed by policy fingerprints, kill switches, secure procedures, and deterministic fallback.
             </div>
@@ -3097,7 +3332,7 @@ def render_hero():
                 <span class="pill">Bulk Material Included</span>
                 <span class="pill">COALESCE Missing Cost → 0</span>
                 <span class="pill">CSS + FMIS + TDS Risk Layer</span>
-                <span class="pill">Cortex RFQ Upload</span>
+                <span class="pill">Cortex RFQ Intake</span>
                 <span class="pill">RFQ/BMCS Trust Gate</span>
                 <span class="pill">Governed Decision Hierarchy</span>
                 <span class="pill">Secure Runtime Boundary</span>
@@ -3122,18 +3357,11 @@ def format_table_money(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # Streamlit UI - polished glass/classy version
 # ============================================================
 
-st.set_page_config(
-    page_title="KMAT Governed Cost Command Center",
-    page_icon="🚚",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
 
 html, body, [data-testid="stAppViewContainer"] {
     background:
@@ -3142,7 +3370,7 @@ html, body, [data-testid="stAppViewContainer"] {
         radial-gradient(circle at 55% 92%, rgba(56,189,248,0.10) 0%, transparent 30%),
         linear-gradient(145deg, #06101E 0%, #0D1628 48%, #111B2D 100%) !important;
     color: #EEF6FF !important;
-    font-family: 'Inter', sans-serif !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif !important;
 }
 
 [data-testid="stHeader"] {
@@ -3256,7 +3484,7 @@ html, body, [data-testid="stAppViewContainer"] {
     color: #67E8F9 !important;
     font-size: 24px !important;
     font-weight: 800 !important;
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace !important;
 }
 [data-testid="stMetricDelta"] {
     font-size: 12px !important;
@@ -3342,7 +3570,7 @@ footer { visibility: hidden; }
 inject_custom_css()
 inject_consistent_glass_overrides()
 initialize_widget_state()
-allowed_values = load_allowed_values_cached()
+allowed_values = load_allowed_values()
 render_hero()
 
 try:
@@ -3367,7 +3595,7 @@ active_snowflake_role = optional_text(
 with st.expander("About this dashboard", expanded=False):
     st.write(
         """
-- Upload or paste an RFQ and use Cortex to extract KMAT configuration values such as ENGINE, CAB, WHEEL, and COLOR.
+- Paste RFQ text or select an available RFQ document and use Cortex to extract KMAT configuration values such as ENGINE, CAB, WHEEL, and COLOR.
 - Review BMCS confidence, risk-adjusted costing, and trusted-cost eligibility before running the final KMAT cost simulation.
 - Compare deterministic rules, ML advisory values, approved shadow overrides, safe defaults, and final governed values.
 - Inspect policy/model lineage, safety gates, runtime kill switches, policy fingerprints, policy seals, and audit events.
@@ -5298,13 +5526,13 @@ with main_tabs[1]:
         )
 
 # -----------------------------
-# Tab 1: Cortex RFQ Upload / Intake
+# Tab 1: Cortex RFQ Intake / Intake
 # -----------------------------
 
 with main_tabs[0]:
     section("Cortex RFQ Document Intake", "📄")
     st.markdown(
-        '<div class="tab-subtitle">Upload an RFQ document or paste RFQ text. Cortex handles text extraction, translation, summary, KMAT configuration extraction, RFQ complexity classification, and BMCS scoring.</div>',
+        '<div class="tab-subtitle">Paste RFQ text or select an available RFQ document. Cortex handles text extraction, translation, summary, KMAT configuration extraction, RFQ complexity classification, and BMCS scoring.</div>',
         unsafe_allow_html=True,
     )
 
@@ -5313,7 +5541,7 @@ with main_tabs[0]:
         <div class="rfq-callout">
             <div class="rfq-callout-title">Uniform RFQ-to-Cost Workflow</div>
             <div class="rfq-callout-text">
-                Step 1: Upload or paste RFQ → Step 2: Process with Cortex → Step 3: Review BMCS → Step 4: Prepare simulation → Step 5: Run cost engine.
+                Step 1: Paste text or select an available RFQ → Step 2: Process with Cortex → Step 3: Review BMCS → Step 4: Prepare simulation → Step 5: Run cost engine.
                 For PDF uploads, the Snowflake stage must use server-side encryption: <b>ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')</b>.
             </div>
         </div>
@@ -5365,39 +5593,103 @@ with main_tabs[0]:
         )
 
     with intake_cols[1]:
-        st.markdown("#### RFQ Document / Text")
+        st.markdown("#### RFQ Source")
+
         input_mode = st.radio(
             "Input Mode",
-            ["Upload document", "Paste text"],
+            [
+                "Paste RFQ text",
+                "Select available RFQ document",
+            ],
             horizontal=True,
             key="cortex_rfq_input_mode",
+            help=(
+                "Choose pasted text or a document already available "
+                "in the governed RFQ source."
+            ),
         )
 
-        uploaded_rfq_file = None
         pasted_rfq_text = ""
+        selected_rfq_document = None
 
-        if input_mode == "Upload document":
-            uploaded_rfq_file = st.file_uploader(
-                "Upload PDF, DOCX, or TXT RFQ",
-                type=["pdf", "docx", "txt"],
-                key="cortex_rfq_file_upload",
-                help="For PDFs, use a searchable PDF. Scanned/image PDFs need OCR or Document AI.",
-            )
-            if uploaded_rfq_file is not None:
-                st.caption(f"Selected file: {uploaded_rfq_file.name}")
-            st.text_area(
-                "Optional note / fallback RFQ text",
-                height=110,
-                placeholder="Optional: paste text here only if you also want a text fallback.",
-                key="cortex_rfq_optional_text_area",
-            )
-        else:
+        if input_mode == "Paste RFQ text":
             pasted_rfq_text = st.text_area(
                 "Paste RFQ text",
                 height=220,
-                placeholder="Example: Heavy-duty red truck with premium cabin, enhanced terrain package and high-output engine.",
+                placeholder=(
+                    "Example: Heavy-duty red truck with premium "
+                    "cabin, enhanced terrain package and "
+                    "high-output engine."
+                ),
                 key="cortex_rfq_text_area",
             )
+        else:
+            catalog_cols = st.columns([5, 1])
+
+            try:
+                available_rfq_documents = (
+                    load_available_rfq_documents()
+                )
+                document_catalog_error = None
+            except Exception as exc:
+                available_rfq_documents = []
+                document_catalog_error = str(exc)
+
+            with catalog_cols[1]:
+                st.markdown(" ")
+                if st.button(
+                    "Refresh",
+                    use_container_width=True,
+                    key="btn_refresh_rfq_document_catalog",
+                ):
+                    soft_rerun()
+
+            with catalog_cols[0]:
+                if document_catalog_error:
+                    note(
+                        "The available RFQ document list could not "
+                        "be loaded. Ask the data administrator to "
+                        "verify the governed RFQ source.",
+                        "warning",
+                    )
+                elif not available_rfq_documents:
+                    note(
+                        "No PDF, DOCX, or TXT RFQ documents are "
+                        "currently available. Add a document through "
+                        "the governed ingestion process, then refresh.",
+                        "soft",
+                    )
+                else:
+                    document_lookup = {
+                        item["display_label"]: item
+                        for item in available_rfq_documents
+                    }
+                    selected_document_label = st.selectbox(
+                        "Available RFQ document",
+                        options=list(document_lookup.keys()),
+                        key="cortex_available_rfq_document",
+                    )
+                    selected_rfq_document = document_lookup[
+                        selected_document_label
+                    ]
+
+                    st.caption(
+                        f"{selected_rfq_document['document_type']} "
+                        f"document selected"
+                    )
+
+                    with st.expander(
+                        "Technical document lineage",
+                        expanded=False,
+                    ):
+                        st.code(
+                            "Stage: "
+                            + selected_rfq_document["stage_name"]
+                        )
+                        st.code(
+                            "Path: "
+                            + selected_rfq_document["relative_path"]
+                        )
 
     note(
         "Use the buttons from left to right. Process the RFQ with Cortex, run the existing RFQ quote pipeline, then attach Phase 10A/10B governance without overwriting the RFQ trust result.",
@@ -5426,18 +5718,44 @@ with main_tabs[0]:
             normalized_rfq_id = normalize_id(rfq_id, "RFQ ID")
             normalized_customer_id = normalize_id(rfq_customer_id, "Customer ID")
 
-            if input_mode == "Upload document" and uploaded_rfq_file is None:
-                raise ValueError("Please upload an RFQ document or switch to Paste text mode.")
-            if input_mode == "Paste text" and not pasted_rfq_text.strip():
-                raise ValueError("Please paste RFQ text or switch to Upload document mode.")
+            if input_mode == "Paste RFQ text":
+                if not pasted_rfq_text.strip():
+                    raise ValueError(
+                        "Please paste RFQ text before processing."
+                    )
 
-            with st.spinner("Uploading RFQ and running Cortex intake pipeline..."):
-                upload_result = upload_rfq_file_to_stage(normalized_rfq_id, uploaded_rfq_file)
+                source_document_name = (
+                    f"{normalized_rfq_id}_manual_text.txt"
+                )
+                source_document_type = "TEXT"
+                source_text_for_header = pasted_rfq_text.strip()
+                source_stage_name = None
+                source_stage_relative_path = None
 
-                source_document_name = upload_result["source_document_name"] or f"{normalized_rfq_id}_manual_text.txt"
-                source_document_type = upload_result["source_document_type"] or "TEXT"
-                source_text_for_header = pasted_rfq_text.strip() if input_mode == "Paste text" else ""
+            else:
+                if selected_rfq_document is None:
+                    raise ValueError(
+                        "Select an available RFQ document before "
+                        "processing."
+                    )
 
+                source_document_name = (
+                    selected_rfq_document["document_name"]
+                )
+                source_document_type = (
+                    selected_rfq_document["document_type"]
+                )
+                source_stage_name = (
+                    selected_rfq_document["stage_name"]
+                )
+                source_stage_relative_path = (
+                    selected_rfq_document["relative_path"]
+                )
+                source_text_for_header = ""
+
+            with st.spinner(
+                "Saving RFQ source and running Cortex intake..."
+            ):
                 upsert_rfq_header_for_cortex(
                     rfq_id=normalized_rfq_id,
                     customer_id=normalized_customer_id,
@@ -5446,11 +5764,15 @@ with main_tabs[0]:
                     source_document_type=source_document_type,
                     source_document_text=source_text_for_header,
                     source_language_code=source_language_code,
-                    source_stage_name=upload_result["stage_name"],
-                    source_stage_relative_path=upload_result["relative_path"],
+                    source_stage_name=source_stage_name,
+                    source_stage_relative_path=(
+                        source_stage_relative_path
+                    ),
                 )
 
-                cortex_result = run_cortex_rfq_intake(normalized_rfq_id)
+                cortex_result = run_cortex_rfq_intake(
+                    normalized_rfq_id
+                )
 
             st.session_state["last_cortex_rfq_id"] = normalized_rfq_id
             st.session_state["last_cortex_result"] = cortex_result
@@ -5464,8 +5786,6 @@ with main_tabs[0]:
 
         except Exception as exc:
             st.error(f"Cortex RFQ intake failed: {exc}")
-            if "Client Side Encryption" in str(exc) or "SNOWFLAKE_SSE" in str(exc):
-                note("Fix the RFQ_DOC_STAGE using server-side encryption: CREATE OR REPLACE STAGE CORE_INPUT.RFQ_DOC_STAGE ENCRYPTION=(TYPE='SNOWFLAKE_SSE') DIRECTORY=(ENABLE=TRUE); then re-upload the file.", "warning")
 
     selected_rfq_for_actions = st.session_state.get("last_cortex_rfq_id", rfq_id)
 
