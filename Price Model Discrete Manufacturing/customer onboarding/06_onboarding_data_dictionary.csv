@@ -1,0 +1,19 @@
+﻿TARGET_COLUMN,REQUIRED,EXPECTED_FORMAT,NOTES
+CUSTOMER_ID,Yes,Text,Must match CUSTOMER_AGREEMENTS for automatic customer preselection.
+CUSTOMER_NAME,No,Text,
+SKU,Yes,Text,Must match the Price Engine product list for automatic preselection.
+PRODUCT_NAME,No,Text,
+PRODUCT_CATEGORY,No,Text,
+PLANT,No,Text,
+PRODUCT_COST,Yes,Number >= 0,Standalone customer-provided input; not a Cost Model calculation.
+SELLING_PRICE,No,Number >= 0,
+TARGET_MARGIN,No,Number 0-100,
+DISCOUNT_PERCENT,No,Number 0-100,
+FREIGHT,No,Number >= 0,
+PACKAGING,No,Number >= 0,
+TAX_PERCENT,No,Number 0-100,
+OTHER_CHARGES,No,Number >= 0,
+CURRENCY,Yes,INR/USD/EUR/GBP/JPY,Must be one of the configured currency codes.
+CUSTOMER_SEGMENT,No,Text,
+SALES_CHANNEL,No,Text,
+EFFECTIVE_DATE,No,YYYY-MM-DD,Use ISO date format YYYY-MM-DD.

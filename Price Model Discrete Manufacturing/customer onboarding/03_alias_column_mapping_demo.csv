@@ -1,0 +1,4 @@
+﻿CustomerCode,CustomerName,MaterialNumber,Description,Category,PlantName,StandardCost,NetPrice,MarginPct,DiscountPct,FreightCost,PackagingCost,TaxPct,Surcharge,CurrencyCode,CustomerGroup,Channel,EffectiveFrom
+CUST-DEMO-001,Demo Alpha Manufacturing,SKU-DEMO-001,Industrial Pump A,Pumps,PLANT-DEMO-01,12500,18500,28,5,700,250,18,100,INR,Enterprise,Direct,2026-08-01
+CUST-DEMO-001,Demo Alpha Manufacturing,SKU-DEMO-002,Control Valve B,Valves,PLANT-DEMO-01,8200,12600,25,4,420,160,18,80,INR,Enterprise,Direct,2026-08-01
+CUST-DEMO-002,Demo Beta Components,SKU-DEMO-003,Precision Gear C,Gears,PLANT-DEMO-02,4600,7100,24,3,260,90,18,50,INR,OEM,OEM,2026-08-01

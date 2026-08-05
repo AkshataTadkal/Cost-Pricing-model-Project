@@ -1,0 +1,4 @@
+﻿CUSTOMER_ID,CUSTOMER_NAME,CUSTOMER_SEGMENT,CURRENCY,SALES_CHANNEL
+CUST-DEMO-001,Demo Alpha Manufacturing,Enterprise,INR,Direct
+CUST-DEMO-002,Demo Beta Components,OEM,INR,OEM
+CUST-DEMO-003,Demo Gamma Distribution,Distributor,INR,Distributor
