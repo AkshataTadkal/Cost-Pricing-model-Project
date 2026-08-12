@@ -1268,118 +1268,330 @@ def compute_quote_health_score(
     }
 
 
+# ---------------------------------------------------
+# CORTEX INTEGRATION
+# ---------------------------------------------------
+import requests
+CORTEX_MODEL = "llama3.1-70b"   # swap for 'mistral-large2' etc. if unavailable in your region
+
+
+def call_cortex(model: str, prompt: str) -> dict:
+    """
+    Drop-in replacement for call_gemini(api_key, model, prompt) — same
+    return shape, so build_copilot_prompt()/render_copilot_result() keep
+    working unmodified if you use them elsewhere. No API key needed:
+    Cortex COMPLETE runs natively inside Snowflake.
+    """
+    try:
+        result = session.sql(
+            "SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?) AS RESPONSE",
+            params=[model, prompt],
+        ).collect()
+        raw_text = result[0]["RESPONSE"]
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        parsed = json.loads(match.group(0)) if match else {}
+        return {
+            "recommended_price": parsed.get("recommended_price", "N/A"),
+            "leakage_cause": parsed.get("leakage_cause", "N/A"),
+            "margin_risk": parsed.get("margin_risk", "N/A"),
+            "competitor_analysis": parsed.get("competitor_analysis", "N/A"),
+            "executive_summary": parsed.get("executive_summary", "N/A"),
+            "confidence": parsed.get("confidence", "Medium"),
+            "raw_text": raw_text, "error": None,
+            "headline": parsed.get("headline", ""),
+            "critical_risk": parsed.get("critical_risk", ""),
+            "top_opportunity": parsed.get("top_opportunity", ""),
+            "margin_outlook": parsed.get("margin_outlook", ""),
+            "recommended_actions": parsed.get("recommended_actions", ""),
+            "portfolio_health_score": parsed.get("portfolio_health_score", "N/A"),
+            "health_label": parsed.get("health_label", ""),
+            "approval_recommendation": parsed.get("approval_recommendation", ""),
+            "risk_factors": parsed.get("risk_factors", ""),
+            "negotiation_guidance": parsed.get("negotiation_guidance", ""),
+            "conditions": parsed.get("conditions", ""),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_cortex_available() -> bool:
+    """Cached per-session ping so the status badge doesn't hit Cortex on every rerun."""
+    if "cortex_available" not in st.session_state:
+        try:
+            session.sql(
+                "SELECT SNOWFLAKE.CORTEX.COMPLETE(?, ?) AS R",
+                params=[CORTEX_MODEL, "ping"],
+            ).collect()
+            st.session_state["cortex_available"] = True
+        except Exception:
+            st.session_state["cortex_available"] = False
+    return st.session_state["cortex_available"]
+
+
+
+def build_copilot_prompt(
+    product, currency_symbol, material_cost, machine_cost, setup_cost, overhead_cost, total_mfg_cost,
+    base_price, total_surcharge, floor_price, target_price, ceiling_price, actual_price,
+    achieved_margin, target_margin_pct, leakage, leakage_percent, order_qty,
+    volume_discount_pct, manual_discount_pct, competitor_data, selected_options,
+    healthy_threshold, warning_threshold, floor_buffer_pct=15,
+) -> str:
+    comp_block = ""
+    if competitor_data:
+        comp_lines = "\n".join(f"  - {c['name']}: {currency_symbol}{c['price']:,.0f}" for c in competitor_data)
+        avg_comp   = sum(c["price"] for c in competitor_data) / len(competitor_data)
+        vs_market  = (actual_price - avg_comp) / avg_comp * 100
+        comp_block = f"Competitor Prices:\n{comp_lines}\nMarket Average: {currency_symbol}{avg_comp:,.0f}\nOur price vs market: {vs_market:+.1f}%"
+    else:
+        comp_block = "Competitor Prices: Not provided."
+    opts_block = ", ".join(f"{k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in selected_options.items()) or "None"
+    return f"""You are an expert B2B manufacturing pricing strategist. Analyse this quote and respond ONLY with a JSON object (no markdown, no text outside the JSON block).
+
+=== QUOTE CONTEXT ===
+Product: {product} | Currency: {currency_symbol} | Order Quantity: {order_qty} units | Selected Options: {opts_block}
+
+=== COST STRUCTURE ===
+Material: {currency_symbol}{material_cost:,.0f} | Machine: {currency_symbol}{machine_cost:,.0f} | Setup: {currency_symbol}{setup_cost:,.0f} | Overhead: {currency_symbol}{overhead_cost:,.0f} | Total Mfg: {currency_symbol}{total_mfg_cost:,.0f}
+
+=== PRICING BANDS ===
+Floor: {currency_symbol}{floor_price:,.0f} | Target: {currency_symbol}{target_price:,.0f} | Ceiling: {currency_symbol}{ceiling_price:,.0f} | Quoted: {currency_symbol}{actual_price:,.0f}
+
+=== PERFORMANCE ===
+Achieved Margin: {achieved_margin:.1f}% (target: {target_margin_pct}%) | Leakage: {currency_symbol}{leakage:,.0f} ({leakage_percent:.1f}%)
+Volume Discount: {volume_discount_pct:.1f}% | Manual Discount: {manual_discount_pct:.1f}%
+Leakage Thresholds: Healthy < {healthy_threshold}% | High Risk > {warning_threshold}%
+
+=== MARKET DATA ===
+{comp_block}
+
+Respond ONLY with:
+{{"recommended_price":"<symbol+number>","leakage_cause":"<2-3 sentences>","margin_risk":"<High/Medium/Low> — <explanation>","competitor_analysis":"<2-3 sentences>","executive_summary":"<4-5 sentences>","confidence":"<High/Medium/Low>"}}"""
+
+
+def render_copilot_result(result: dict, currency_symbol: str):
+    if result.get("error"):
+        st.markdown(f'<div class="insight-box alert">🚨 Gemini API error: {result["error"]}</div>', unsafe_allow_html=True)
+        return
+    risk_level = result.get("margin_risk", "").split("—")[0].strip().lower()
+    risk_class = "ai-risk-high" if "high" in risk_level else ("ai-risk-medium" if "medium" in risk_level else "ai-risk-low")
+    risk_icon  = "🔴" if "high" in risk_level else ("🟡" if "medium" in risk_level else "🟢")
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.markdown(f"""
+    <div class="copilot-panel">
+      <div class="copilot-header">
+        <div class="copilot-icon">🤖</div>
+        <div><div class="copilot-title">AI Pricing Copilot</div><div class="copilot-sub">AI Pricing Assistant · {result.get("confidence","High")} Confidence</div></div>
+      </div>
+      <div class="copilot-body">
+        <div class="ai-section"><div class="ai-section-label">⭐ Recommended Price</div>
+          <div class="ai-section-value"><span class="ai-price-highlight">{result['recommended_price']}</span></div></div>
+        <div class="ai-section"><div class="ai-section-label">💧 Leakage Cause Analysis</div>
+          <div class="ai-section-value">{result['leakage_cause']}</div></div>
+        <div class="ai-section"><div class="ai-section-label">⚠️ Margin Risk</div>
+          <div class="ai-section-value"><span class="{risk_class}">{risk_icon} {result['margin_risk']}</span></div></div>
+        <div class="ai-section"><div class="ai-section-label">🏁 Competitor Analysis</div>
+          <div class="ai-section-value">{result['competitor_analysis']}</div></div>
+        <div class="ai-section" style="border-color:rgba(6,182,212,0.3);background:rgba(6,182,212,0.04);">
+          <div class="ai-section-label" style="color:#34d399;">📋 Executive Summary</div>
+          <div class="ai-section-value" style="line-height:1.75;">{result['executive_summary']}</div></div>
+      </div>
+      <div class="copilot-footer"><span>Generated at {ts}</span><div class="gemini-badge">✦ AI INSIGHTS</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def generate_copilot_brief() -> str:
+    """Daily Intelligence Brief — reads last 24h of QUOTE_HISTORY, asks Cortex to summarize."""
+    try:
+        kpi_df = session.sql(f"""
+            SELECT COUNT(*) AS TOTAL_QUOTES,
+                   SUM(ACTUAL_PRICE) AS TOTAL_REVENUE,
+                   SUM(LEAKAGE) AS TOTAL_LEAKAGE,
+                   AVG(ACHIEVED_MARGIN_PCT) AS AVG_MARGIN,
+                   SUM(CASE WHEN HEALTH_SCORE < 50 THEN 1 ELSE 0 END) AS RISKY_COUNT
+            FROM {fq_pricing('QUOTE_HISTORY')}
+            WHERE TIMESTAMP >= DATEADD(day, -1, CURRENT_TIMESTAMP())
+        """).to_pandas()
+
+        top_leak_df = session.sql(f"""
+            SELECT QUOTE_ID, CUSTOMER_NAME, PRODUCT, LEAKAGE, ACHIEVED_MARGIN_PCT
+            FROM {fq_pricing('QUOTE_HISTORY')}
+            ORDER BY LEAKAGE DESC LIMIT 1
+        """).to_pandas()
+
+        top_rev_df = session.sql(f"""
+            SELECT QUOTE_ID, CUSTOMER_NAME, PRODUCT, ACTUAL_PRICE
+            FROM {fq_pricing('QUOTE_HISTORY')}
+            ORDER BY ACTUAL_PRICE DESC LIMIT 1
+        """).to_pandas()
+    except Exception as e:
+        return f"Could not read quote history: {e}"
+
+    data_block = f"""
+LAST 24 HOURS KPI SNAPSHOT:
+{kpi_df.to_csv(index=False) if not kpi_df.empty else 'No quotes in the last 24 hours.'}
+
+HIGHEST LEAKAGE QUOTE (all time):
+{top_leak_df.to_csv(index=False) if not top_leak_df.empty else 'None.'}
+
+HIGHEST REVENUE QUOTE (all time):
+{top_rev_df.to_csv(index=False) if not top_rev_df.empty else 'None.'}
+"""
+
+    prompt = f"""You are a pricing analytics assistant for a B2B manufacturing company.
+Using ONLY the data below, write a concise Daily Intelligence Brief with these
+sections: Today's KPI Summary, Highest Revenue Quote, Highest Leakage Quote,
+Average Margin, Number of Risky Quotes, Business Recommendations (2-3 bullets),
+and a 2-3 sentence Executive Summary. If a section has no data, say so briefly
+rather than guessing.
+
+DATA:
+{data_block}
+"""
+    result = call_cortex(CORTEX_MODEL, prompt)
+    return result.get("raw_text") or result.get("error") or "No response."
+
+
+def score_deal_risk_for_quote(q: dict) -> dict:
+    """
+    Scores the active quote (st.session_state['quote']) for risk.
+    Returns {"risk_score": int|None, "top_factors": [...], "suggested_action": str|None}
+    """
+    context = f"""
+QUOTE UNDER REVIEW
+Product: {q.get('product')}
+Target Price: {q.get('target_price')}
+Quoted Price: {q.get('actual_price')}
+Leakage: {q.get('leakage')} ({q.get('leakage_percent', 0):.1f}%)
+Achieved Margin: {q.get('achieved_margin', 0):.1f}%
+Order Qty: {q.get('order_qty')}
+Volume Discount: {q.get('volume_discount_pct', 0):.1f}%
+Manual Discount: {q.get('manual_discount_pct', 0):.1f}%
+Floor Price: {q.get('floor_price')}
+Ceiling Price: {q.get('ceiling_price')}
+Internal Health Score: {q.get('health_score')}/100
+Internal Routing Decision: {q.get('routing')}
+"""
+    prompt = f"""You are a deal-risk scoring assistant for B2B manufacturing quotes.
+Based ONLY on the quote data below, respond ONLY with a JSON object — no
+markdown, no text outside the JSON:
+{{"risk_score": <integer 0-100, 0=no risk 100=critical risk>, "top_factors": ["factor 1","factor 2","factor 3"], "suggested_action": "<one clear, specific next step>"}}
+
+{context}
+"""
+    result = call_cortex(CORTEX_MODEL, prompt)
+    if result.get("error"):
+        return {"risk_score": None, "top_factors": [result["error"]], "suggested_action": None}
+
+    raw = result.get("raw_text", "") or ""
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return {"risk_score": None, "top_factors": [raw or "Could not parse a response."], "suggested_action": None}
+
+    try:
+        parsed = json.loads(match.group(0))
+        rs = parsed.get("risk_score")
+        return {
+            "risk_score": int(rs) if rs is not None else None,
+            "top_factors": parsed.get("top_factors", []) or [],
+            "suggested_action": parsed.get("suggested_action"),
+        }
+    except Exception:
+        return {"risk_score": None, "top_factors": [raw], "suggested_action": None}
+
+
+def detect_margin_anomalies(z_thresh: float) -> pd.DataFrame:
+    """
+    Pure-pandas z-score outlier scan — no LLM call needed for this one.
+    Flags quotes whose ACHIEVED_MARGIN_PCT deviates from their product's
+    own historical mean by more than z_thresh standard deviations.
+    """
+    try:
+        df = session.sql(f"""
+            SELECT QUOTE_ID, PRODUCT, CUSTOMER_NAME, ACHIEVED_MARGIN_PCT, TIMESTAMP
+            FROM {fq_pricing('QUOTE_HISTORY')}
+        """).to_pandas()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty or "ACHIEVED_MARGIN_PCT" not in df.columns:
+        return pd.DataFrame()
+
+    stats = df.groupby("PRODUCT")["ACHIEVED_MARGIN_PCT"].agg(["mean", "std"]).reset_index()
+    merged = df.merge(stats, on="PRODUCT", how="left")
+
+    # Guard against zero/NaN std (e.g. a product with only one quote so far)
+    fallback_std = merged["ACHIEVED_MARGIN_PCT"].std() or 1.0
+    merged["std"] = merged["std"].fillna(fallback_std).replace(0, fallback_std)
+
+    merged["Z_SCORE"] = (merged["ACHIEVED_MARGIN_PCT"] - merged["mean"]) / merged["std"]
+    anomalies = merged[merged["Z_SCORE"].abs() >= z_thresh].copy()
+    anomalies = anomalies.reindex(anomalies["Z_SCORE"].abs().sort_values(ascending=False).index)
+    return anomalies
+
+
+def log_copilot_action(feature_name: str, content: str, status: str, quote_id: str = None):
+    """Writes one row to COPILOT_ACTION_LEDGER. Adjust column names if yours differ."""
+    content_esc = (content or "").replace("'", "''")
+    feature_esc = (feature_name or "").replace("'", "''")
+    status_esc = (status or "").replace("'", "''")
+    qid_esc = (quote_id or "").replace("'", "''")
+    try:
+        session.sql(f"""
+            INSERT INTO {fq_pricing('COPILOT_ACTION_LEDGER')}
+                (LOG_ID, TIMESTAMP, FEATURE_NAME, CONTENT, STATUS, QUOTE_ID)
+            SELECT '{uuid.uuid4()}', CURRENT_TIMESTAMP(), '{feature_esc}', '{content_esc}', '{status_esc}', '{qid_esc}'
+        """).collect()
+    except Exception as e:
+        st.warning(f"Could not write to Action Ledger: {e}")
+def _extract_ai_json(raw_text):
+    """Local JSON parser for the new sections below. Mirrors the same
+    regex-extraction pattern already used inside call_cortex(), kept
+    separate so call_cortex()'s existing return contract is untouched."""
+    if not raw_text:
+        return {}
+    try:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if not match:
+            return {}
+        return json.loads(match.group(0))
+    except Exception:
+        return {}
+
+def sanitize_timestamp_series(series, min_bound=None, max_bound=None):
+    """
+    Reusable timestamp sanitizer for untyped/legacy schema columns.
+    Forces standard nanosecond-precision datetime64[ns] and clips any
+    value outside pandas' ns-safe Timestamp range. This guarantees every
+    value is safely representable by Python's datetime.date, by pandas
+    itself, AND by libraries (like Plotly) that assume ns precision
+    internally — preventing NotImplementedError, OutOfBoundsDatetime,
+    and silent year-overflow bugs (e.g. "year 229257").
+    """
+    # Use pandas' own ns-safe bounds unless the caller overrides them.
+    lo = pd.Timestamp(min_bound) if min_bound else pd.Timestamp.min + pd.Timedelta(days=1)
+    hi = pd.Timestamp(max_bound) if max_bound else pd.Timestamp.max - pd.Timedelta(days=1)
+
+    s = pd.to_datetime(series, errors="coerce")
+    s = s.clip(lower=lo, upper=hi)
+
+    # Explicitly force ns-precision dtype — strips out any wider-precision
+    # (us/s) or Arrow-backed dtype that slipped through from Snowflake.
+    s = s.astype("datetime64[ns]")
+
+    if s.isna().all():
+        today = pd.Timestamp(datetime.now().date())
+        s = pd.Series([today] * len(series), index=series.index)
+    else:
+        s = s.fillna(lo)
+
+    return s
+
+
+
 import random
 import pandas as pd
 from datetime import datetime, timedelta
 
-
-def generate_demo_quotes(n_quotes=100):
-
-    product_df = session.table(fq("KMAT_PRODUCT_MASTER")).to_pandas()
-
-    sim_df = session.table(fq("SIMULATION_HEADER")).to_pandas()
-
-    summary_df = session.table(
-        fq("KMAT_CONFIGURED_COST_SUMMARY")
-    ).to_pandas()
-
-    quote_rows = []
-
-    for _ in range(n_quotes):
-
-        sim = sim_df.sample(1).iloc[0]
-
-        summary = summary_df[
-            summary_df["SIMULATION_ID"] == sim["SIMULATION_ID"]
-        ].iloc[0]
-
-        product = product_df[
-            product_df["KMAT_ID"] == sim["KMAT_ID"]
-        ].iloc[0]
-
-        total_cost = float(summary["TOTAL_CONFIGURED_COST_USD"])
-
-        target = float(summary["TARGET_PRICE_USD"])
-
-        floor = float(summary["FLOOR_PRICE_USD"])
-
-        ceiling = float(summary["CEILING_PRICE_USD"])
-
-        actual = random.uniform(floor, ceiling)
-
-        leakage = max(target - actual, 0)
-
-        margin = ((actual - total_cost) / actual) * 100
-
-        qty = random.randint(5, 500)
-
-        approval = (
-            "Auto Approval"
-            if margin >= 20
-            else "Manager Approval"
-            if margin >= 12
-            else "Finance Review"
-        )
-
-        quote_rows.append({
-
-            "QUOTE_ID":
-                f"Q{1000+_}",
-
-            "QUOTE_DATE":
-                datetime.now() - timedelta(days=random.randint(0,90)),
-
-            "CUSTOMER_NAME":
-                f"Customer {random.randint(1,20)}",
-
-            "PRODUCT":
-                product["DESCRIPTION"],
-
-            "KMAT_ID":
-                sim["KMAT_ID"],
-
-            "SIMULATION_ID":
-                sim["SIMULATION_ID"],
-
-            "ORDER_QTY":
-                qty,
-
-            "TARGET_PRICE":
-                round(target,2),
-
-            "ACTUAL_PRICE":
-                round(actual,2),
-
-            "TOTAL_MANUFACTURING_COST":
-                round(total_cost,2),
-
-            "LEAKAGE":
-                round(leakage,2),
-
-            "MARGIN_PCT":
-                round(margin,2),
-
-            "HEALTH_SCORE":
-                random.randint(70,100),
-
-            "APPROVAL_STATUS":
-                approval
-
-        })
-
-        df = pd.DataFrame(quote_rows)
-        df = df.rename(columns={"QUOTE_DATE": "TIMESTAMP"})
-    
-        session.write_pandas(
-            df,
-            "QUOTE_HISTORY",
-            database=PRICING_DB,
-            schema=PRICING_CORE_OUTPUT_SCHEMA,
-            overwrite=False,
-            auto_create_table=True
-        )
-    
-        st.success(f"{len(df)} demo quotes generated.")
 # ---------------------------------------------------
 # MAIN TABS
 # ---------------------------------------------------
@@ -3192,7 +3404,7 @@ with tab2:
                 chosen_label = st.selectbox("Product", list(kmat_label_map.keys()), label_visibility="collapsed")
                 kmat_id = kmat_label_map[chosen_label]
                 product = kmat_master_df[kmat_master_df["KMAT_ID"] == kmat_id]["DESCRIPTION"].iloc[0]
-
+                product_name = product 
         # ── 2. Load Simulations for this KMAT_ID ───────────────────────────
         try:
             sim_header_df = session.sql(
@@ -3923,7 +4135,8 @@ with tab3:
         quotes = session.sql(f"SELECT * FROM {fq_pricing('QUOTE_HISTORY')} ORDER BY TIMESTAMP DESC").to_pandas()
     except Exception:
         quotes = pd.DataFrame()
-
+    if not quotes.empty and "TIMESTAMP" in quotes.columns:
+        quotes["TIMESTAMP"] = sanitize_timestamp_series(quotes["TIMESTAMP"])
     required_cols = {"PRODUCT","TARGET_PRICE","ACTUAL_PRICE","LEAKAGE","TIMESTAMP",
                      "MATERIAL_COST","MACHINE_COST","SETUP_COST","OVERHEAD_COST","TOTAL_MANUFACTURING_COST"}
 
@@ -4090,8 +4303,8 @@ with tab3:
                 st.selectbox("Approval Status", ["All"], key="dash_f_approval_na", disabled=True)
 
         with f5:
-            min_ts = pd.to_datetime(quotes["TIMESTAMP"]).min()
-            max_ts = pd.to_datetime(quotes["TIMESTAMP"]).max()
+            min_ts = quotes["TIMESTAMP"].min()
+            max_ts = quotes["TIMESTAMP"].max()
             date_range = st.date_input("Date Range", value=(min_ts.date(), max_ts.date()),
                                         min_value=min_ts.date(), max_value=max_ts.date(), key="dash_f_daterange")
 
@@ -4106,7 +4319,7 @@ with tab3:
         quotes_f = quotes_f[quotes_f["APPROVAL_ROUTING"] == sel_approval]
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_d, end_d = date_range
-        ts_dates = pd.to_datetime(quotes_f["TIMESTAMP"]).dt.date
+        ts_dates = quotes_f["TIMESTAMP"].dt.date
         quotes_f = quotes_f[(ts_dates >= start_d) & (ts_dates <= end_d)]
 
     if quotes_f.empty:
@@ -4929,12 +5142,15 @@ with tab5:
         has_quotes = not all_quotes.empty
     except Exception:
         all_quotes = pd.DataFrame(); has_quotes = False
+    if not all_quotes.empty and "TIMESTAMP" in all_quotes.columns:
+        all_quotes["TIMESTAMP"] = sanitize_timestamp_series(all_quotes["TIMESTAMP"])
+
     try:
         approval_history = session.sql(f"SELECT * FROM {fq_pricing('APPROVAL_WORKFLOW')} ORDER BY SUBMITTED_AT DESC").to_pandas()
         has_approvals = not approval_history.empty
     except Exception:
         approval_history = pd.DataFrame(); has_approvals = False
-
+    
     if not has_quotes:
         st.markdown('<div class="insight-box">📭 No quotes found yet. Save quotes from the Configure Quote tab to populate the Executive Dashboard.</div>', unsafe_allow_html=True)
     else:
@@ -5032,7 +5248,7 @@ with tab5:
             st.markdown('<div class="section-header">Revenue vs Leakage Over Time</div>', unsafe_allow_html=True)
             if "TIMESTAMP" in all_quotes.columns:
                 time_df = all_quotes.sort_values("TIMESTAMP").copy()
-                time_df["TIMESTAMP"] = pd.to_datetime(time_df["TIMESTAMP"])
+                time_df["TIMESTAMP"] = sanitize_timestamp_series(time_df["TIMESTAMP"])
                 fig_exec_trend = go.Figure()
                 fig_exec_trend.add_trace(go.Scatter(x=time_df["TIMESTAMP"], y=time_df["ACTUAL_PRICE"],
                     name="Quoted Revenue", mode="lines+markers", line=dict(color="#3b82f6", width=2),
@@ -5106,6 +5322,7 @@ with tab5:
         if "ACHIEVED_MARGIN_PCT" in all_quotes.columns and "TIMESTAMP" in all_quotes.columns:
             st.markdown('<div class="section-header">Margin Achievement Trend</div>', unsafe_allow_html=True)
             marg_df = all_quotes.sort_values("TIMESTAMP").copy()
+            marg_df["TIMESTAMP"] = sanitize_timestamp_series(marg_df["TIMESTAMP"])
             fig_marg = go.Figure()
             fig_marg.add_hline(y=target_margin_pct, line_dash="dash", line_color="#3b82f6",
                                annotation_text=f"Target {target_margin_pct}%", annotation_font_color="#3b82f6")
@@ -5382,186 +5599,277 @@ with tab7:
 
 
 # ===================================================
-# TAB 9 — 🤖 AI PRICING COPILOT
-# Insert at the very end of the file, right after the `with tab8:` block.
+# TAB 8 — AI PRICING COPILOT
 # ===================================================
-
 with tab8:
-    if "TABLE_MAP" not in st.session_state and st.session_state.get("pricing_mode") != "Demo Mode":
-        st.info("👈 Go to **Customer Onboarding** and load your tables first.")
-        st.stop()
-
-    _copilot_key_ok = bool(GEMINI_API_KEY and len(GEMINI_API_KEY.strip()) > 20)
-
     st.markdown('<div class="section-header">🤖 AI Pricing Copilot</div>', unsafe_allow_html=True)
-    st.caption("Cross-module decision support — reads across Quotes, Approvals, and Cost data.")
+    st.caption("Independent of Configure Quote / Analytics — works even with zero saved quotes.")
 
-    # ── Context Strip ────────────────────────────────────────────────────
-    q = st.session_state.get("quote", {})
-    ctx_cols = st.columns(4)
-    with ctx_cols[0]:
-        st.metric("Active Product", q.get("product", "—"))
-    with ctx_cols[1]:
-        st.metric("Active Simulation", q.get("simulation_id", "—"))
-    with ctx_cols[2]:
-        st.metric("Pricing Mode", st.session_state.get("pricing_mode", "—"))
-    with ctx_cols[3]:
-        st.metric("Gemini Status", "🟢 Configured" if _copilot_key_ok else "🔴 Not configured")
-    st.markdown("---")
+    # ── Local, safe Cortex availability check (never raises) ───────────
+    def _copilot_cortex_ok() -> bool:
+        try:
+            return check_cortex_available()
+        except Exception:
+            return False
 
-    # ── Command Bar / Conversational Console ────────────────────────────
-    st.markdown('<div class="section-header">💬 Ask the Copilot</div>', unsafe_allow_html=True)
-
-    if "copilot_chat_history" not in st.session_state:
-        st.session_state["copilot_chat_history"] = []
-
-    for turn in st.session_state["copilot_chat_history"]:
-        with st.chat_message(turn["role"]):
-            st.markdown(turn["content"])
-
-    copilot_question = st.chat_input("Ask about quotes, margins, approvals, or pricing trends…")
-
-    if copilot_question:
-        st.session_state["copilot_chat_history"].append({"role": "user", "content": copilot_question})
-        with st.chat_message("user"):
-            st.markdown(copilot_question)
-
-        if not _copilot_key_ok:
-            answer = "AI Copilot needs a valid Gemini API key configured to answer questions."
-        else:
-            try:
-                q_hist = session.sql(
-                    f"SELECT * FROM {fq_pricing('QUOTE_HISTORY')} ORDER BY TIMESTAMP DESC LIMIT 30"
-                ).to_pandas()
-            except Exception:
-                q_hist = pd.DataFrame()
-
-            grounding_prompt = f"""You are a pricing analytics assistant for a B2B manufacturing company.
-Answer the question below using the quote data provided. Be concise. If the data doesn't
-support a confident answer, say so rather than guessing.
-
-QUOTE DATA (most recent 30):
-{q_hist.to_csv(index=False) if not q_hist.empty else "No quote data available."}
-
-QUESTION: {copilot_question}
-"""
-            result = call_gemini(GEMINI_API_KEY, GEMINI_MODEL, grounding_prompt)
-            answer = result.get("raw_text") or result.get("error") or "No response."
-
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.session_state["copilot_chat_history"].append({"role": "assistant", "content": answer})
-        log_copilot_action("Conversational Console", answer, "shown")
-
-    st.markdown("---")
-
-    # ── Daily Intelligence Brief ─────────────────────────────────────────
-    st.markdown('<div class="section-header">📋 Daily Intelligence Brief</div>', unsafe_allow_html=True)
-    with st.expander("Today's Brief", expanded=True):
-        if not _copilot_key_ok:
-            st.markdown(
-                '<div class="insight-box warn">⚙️ Configure a Gemini API key to enable the Daily Brief.</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            if st.button("🔄 Generate / Refresh Brief", key="copilot_brief_btn"):
-                with st.spinner("Generating brief…"):
-                    brief_text = generate_copilot_brief()
-                    st.session_state["copilot_brief_text"] = brief_text
-                    log_copilot_action("Daily Intelligence Brief", brief_text, "shown")
-            st.markdown(st.session_state.get("copilot_brief_text", "Click above to generate today's brief."))
-
-    st.markdown("---")
-
-    # ── Deal Risk Panel ──────────────────────────────────────────────────
-    st.markdown('<div class="section-header">⚠️ Deal Risk — Active Quote</div>', unsafe_allow_html=True)
-    if not q:
-        st.caption("Configure a quote in **Configure Quote** to see its risk profile here.")
-    elif not _copilot_key_ok:
+    _cortex_ok = _copilot_cortex_ok()
+    if not _cortex_ok:
         st.markdown(
-            '<div class="insight-box warn">⚙️ Configure a Gemini API key to enable risk scoring.</div>',
-            unsafe_allow_html=True,
+            '<div class="insight-box warn">⚠ Cortex AI is currently unavailable on this account/region. '
+            'You can still use the manual tools below, but AI-generated text will show a friendly message instead.</div>',
+            unsafe_allow_html=True
         )
-    else:
-        if st.button("Score this quote's risk", key="copilot_risk_btn"):
-            with st.spinner("Scoring deal risk…"):
-                risk_result = score_deal_risk_for_quote(q)
-                st.session_state["copilot_risk_result"] = risk_result
-
-        risk_result = st.session_state.get("copilot_risk_result")
-        if risk_result and risk_result.get("risk_score") is not None:
-            rs = risk_result["risk_score"]
-            rs_color = "#10b981" if rs < 35 else ("#f59e0b" if rs < 65 else "#ef4444")
-            st.markdown(
-                f'<div style="font-size:32px;font-weight:700;color:{rs_color};'
-                f'font-family:\'JetBrains Mono\',monospace;">{rs}/100</div>',
-                unsafe_allow_html=True,
-            )
-            for factor in risk_result.get("top_factors", []):
-                st.write(f"- {factor}")
-            if risk_result.get("suggested_action"):
-                st.success(f"Suggested action: {risk_result['suggested_action']}")
-                if st.button("Accept suggestion", key="copilot_accept_risk"):
-                    log_copilot_action(
-                        "Deal Risk Panel", risk_result["suggested_action"], "accepted",
-                        quote_id=q.get("kmat_id"),
-                    )
-                    st.toast("Logged to Action Ledger.")
-        elif risk_result:
-            st.warning("Could not parse a risk score from the AI response.")
-            st.caption(risk_result.get("top_factors", [""])[0])
 
     st.markdown("---")
 
-    # ── Margin Anomaly Detector ──────────────────────────────────────────
-    st.markdown('<div class="section-header">🔍 Margin Anomaly Detector</div>', unsafe_allow_html=True)
-    z_thresh = st.slider("Sensitivity (z-score threshold)", 1.0, 3.0, 1.5, 0.1, key="copilot_z")
+    # ───────────────────────────────────────────────────────────────────
+    # FEATURE 1 — ASK THE COPILOT
+    # ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">💬 Ask the Copilot</div>', unsafe_allow_html=True)
+    st.caption("Ask any pricing, margin, discounting, or negotiation question — no quote data required.")
 
-    if st.button("Scan quote history for anomalies", key="copilot_scan_btn"):
-        with st.spinner("Scanning…"):
-            anomalies = detect_margin_anomalies(z_thresh)
-            st.session_state["copilot_anomalies"] = anomalies
+    ask_question = st.text_area(
+        "Your question",
+        placeholder="e.g. How should I think about volume discounts for a new enterprise customer?",
+        key="copilot_ask_input",
+        label_visibility="collapsed",
+    )
 
-    anomalies = st.session_state.get("copilot_anomalies")
-    if anomalies is not None and not anomalies.empty:
-        show_cols = [c for c in ["QUOTE_ID", "PRODUCT", "ACHIEVED_MARGIN_PCT", "mean", "Z_SCORE", "TIMESTAMP"]
-                     if c in anomalies.columns]
-        st.dataframe(
-            anomalies[show_cols].rename(columns={"mean": "PRODUCT_AVG_MARGIN"}),
-            use_container_width=True,
-        )
-        if st.button("Flag top anomaly for review", key="copilot_flag_btn"):
-            top = anomalies.iloc[0]
-            note = (
-                f"{top.get('PRODUCT')} quote {top.get('QUOTE_ID')} margin "
-                f"{top.get('ACHIEVED_MARGIN_PCT'):.1f}% vs product avg {top.get('mean'):.1f}% "
-                f"(z={top.get('Z_SCORE'):.2f})"
-            )
-            log_copilot_action("Margin Anomaly Detector", note, "flagged", quote_id=top.get("QUOTE_ID"))
-            st.toast("Flagged and logged.")
-    elif anomalies is not None:
-        st.success("No margin anomalies found at this sensitivity.")
-    else:
-        st.caption("Run a scan to check saved quotes for margin outliers.")
+    if st.button("Ask Copilot", key="copilot_ask_btn"):
+        try:
+            if not ask_question or not ask_question.strip():
+                st.warning("Please type a question first.")
+            elif not _cortex_ok:
+                st.info("Cortex AI is currently unavailable — please try again later.")
+            else:
+                with st.spinner("Thinking…"):
+                    prompt = f"""You are an expert B2B manufacturing pricing strategist and pricing coach.
+Answer the user's question below clearly and practically, in 3-6 sentences.
+Do not invent specific numbers, customer names, or product names that were not given to you.
+
+QUESTION:
+{ask_question.strip()}
+"""
+                    result = call_cortex(CORTEX_MODEL, prompt)
+                    if result.get("error"):
+                        st.warning(f"Copilot could not answer right now: {result['error']}")
+                    else:
+                        answer_text = result.get("raw_text") or "No response received."
+                        st.markdown(f'<div class="insight-box ok">🤖 {answer_text}</div>', unsafe_allow_html=True)
+                        try:
+                            log_copilot_action("Ask the Copilot", answer_text, "shown")
+                        except Exception:
+                            pass
+        except Exception as e:
+            st.warning(f"Ask the Copilot is temporarily unavailable: {e}")
 
     st.markdown("---")
 
-    # ── Action Ledger ────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">🧾 Action Ledger</div>', unsafe_allow_html=True)
+    # ───────────────────────────────────────────────────────────────────
+    # FEATURE 2 — DAILY INTELLIGENCE BRIEF (generic/sample data only)
+    # ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📰 Daily Intelligence Brief</div>', unsafe_allow_html=True)
+    st.caption("A sample-data business snapshot and AI commentary — does not query QUOTE_HISTORY.")
+
+    with st.expander("Adjust sample snapshot inputs (optional)", expanded=False):
+        brief_c1, brief_c2, brief_c3 = st.columns(3)
+        with brief_c1:
+            sample_quotes_count = st.number_input("Quotes today", min_value=0, value=12, step=1, key="brief_qcount")
+            sample_avg_margin = st.slider("Average margin %", 0.0, 60.0, 27.5, 0.5, key="brief_margin")
+        with brief_c2:
+            sample_revenue = st.number_input(f"Revenue quoted ({currency_symbol})", min_value=0, value=850000, step=10000, key="brief_rev")
+            sample_leakage = st.number_input(f"Revenue leakage ({currency_symbol})", min_value=0, value=42000, step=1000, key="brief_leak")
+        with brief_c3:
+            sample_risky = st.number_input("Risky quotes (health < 50)", min_value=0, value=2, step=1, key="brief_risky")
+            sample_top_product = st.text_input("Top product (optional)", value="Heavy Duty Truck", key="brief_topprod")
+
+    if st.button("Generate Daily Brief", key="copilot_brief_btn"):
+        try:
+            data_block = f"""
+SAMPLE / MANUALLY-ENTERED SNAPSHOT (not from live quote history):
+Quotes Today: {sample_quotes_count}
+Revenue Quoted: {currency_symbol}{sample_revenue:,.0f}
+Revenue Leakage: {currency_symbol}{sample_leakage:,.0f}
+Average Margin: {sample_avg_margin:.1f}%
+Risky Quotes (health score < 50): {sample_risky}
+Top Product: {sample_top_product or 'Not specified'}
+"""
+            if not _cortex_ok:
+                st.info("Cortex AI is currently unavailable — please try again later.")
+            else:
+                with st.spinner("Generating brief…"):
+                    prompt = f"""You are a pricing analytics assistant for a B2B manufacturing company.
+Using ONLY the sample snapshot below, write a concise Daily Intelligence Brief with sections:
+Today's Snapshot, Margin Commentary, Leakage Commentary, Risk Commentary, and a 2-3 sentence
+Executive Summary. Clearly note this is based on sample/illustrative figures, not live data.
+
+DATA:
+{data_block}
+"""
+                    result = call_cortex(CORTEX_MODEL, prompt)
+                    if result.get("error"):
+                        st.warning(f"Could not generate brief: {result['error']}")
+                    else:
+                        brief_text = result.get("raw_text") or "No response received."
+                        st.markdown(f'<div class="insight-box">{brief_text}</div>', unsafe_allow_html=True)
+                        try:
+                            log_copilot_action("Daily Intelligence Brief", brief_text, "shown")
+                        except Exception:
+                            pass
+        except Exception as e:
+            st.warning(f"Daily Intelligence Brief is temporarily unavailable: {e}")
+
+    st.markdown("---")
+
+    # ───────────────────────────────────────────────────────────────────
+    # FEATURE 3 — DEAL RISK ANALYSIS (fully manual input)
+    # ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">⚠️ Deal Risk Analysis</div>', unsafe_allow_html=True)
+    st.caption("Enter deal details manually — no dependency on any saved quote or product data.")
+
+    risk_c1, risk_c2 = st.columns(2)
+    with risk_c1:
+        risk_product_name = st.text_input("Product Name", value="", placeholder="e.g. Heavy Duty Truck", key="risk_product")
+        risk_selling_price = st.number_input(f"Selling Price ({currency_symbol})", min_value=0.0, value=0.0, step=1000.0, key="risk_price")
+    with risk_c2:
+        risk_margin_pct = st.slider("Margin %", -20.0, 80.0, 25.0, 0.5, key="risk_margin")
+        risk_discount_pct = st.slider("Discount %", 0.0, 50.0, 5.0, 0.5, key="risk_discount")
+
+    if st.button("Generate Risk Assessment", key="copilot_risk_btn"):
+        try:
+            if not risk_product_name.strip():
+                st.warning("Please enter a product name.")
+            elif risk_selling_price <= 0:
+                st.warning("Please enter a selling price greater than 0.")
+            elif not _cortex_ok:
+                st.info("Cortex AI is currently unavailable — please try again later.")
+            else:
+                with st.spinner("Assessing deal risk…"):
+                    deal_block = f"""
+DEAL DETAILS (manually entered by user):
+Product: {risk_product_name.strip()}
+Selling Price: {currency_symbol}{risk_selling_price:,.2f}
+Margin: {risk_margin_pct:.1f}%
+Discount Applied: {risk_discount_pct:.1f}%
+"""
+                    prompt = f"""You are a deal-risk scoring assistant for B2B manufacturing quotes.
+Based ONLY on the deal data below, respond ONLY with a JSON object — no markdown, no text outside JSON:
+{{"risk_score": <integer 0-100, 0=no risk 100=critical risk>, "risk_level":"<Low/Medium/High>", "top_factors": ["factor 1","factor 2","factor 3"], "suggested_action": "<one clear, specific next step>"}}
+
+{deal_block}
+"""
+                    result = call_cortex(CORTEX_MODEL, prompt)
+                    if result.get("error"):
+                        st.warning(f"Could not assess risk: {result['error']}")
+                    else:
+                        raw_text = result.get("raw_text", "") or ""
+                        try:
+                            parsed = _extract_ai_json(raw_text)
+                        except Exception:
+                            parsed = {}
+
+                        if parsed:
+                            score = parsed.get("risk_score", "N/A")
+                            level = parsed.get("risk_level", "N/A")
+                            level_cls = "red" if str(level).lower() == "high" else ("amber" if str(level).lower() == "medium" else "green")
+                            st.markdown(
+                                f'<div class="insight-box"><span class="badge {level_cls}">{level} Risk</span> '
+                                f'&nbsp; Risk Score: <strong>{score}</strong>/100</div>',
+                                unsafe_allow_html=True
+                            )
+                            factors = parsed.get("top_factors", []) or []
+                            if factors:
+                                st.markdown("**Top Risk Factors**")
+                                for f in factors:
+                                    st.write(f"- {f}")
+                            if parsed.get("suggested_action"):
+                                st.success(f"Suggested Action: {parsed['suggested_action']}")
+                        else:
+                            st.markdown(f'<div class="insight-box">{raw_text or "No response received."}</div>', unsafe_allow_html=True)
+
+                        try:
+                            log_copilot_action("Deal Risk Analysis", raw_text, "shown")
+                        except Exception:
+                            pass
+        except Exception as e:
+            st.warning(f"Deal Risk Analysis is temporarily unavailable: {e}")
+
+    st.markdown("---")
+
+    # ───────────────────────────────────────────────────────────────────
+    # FEATURE 4 — EXECUTIVE RECOMMENDATIONS (generic pricing knowledge)
+    # ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🏆 Executive Recommendations</div>', unsafe_allow_html=True)
+    st.caption("Five general pricing recommendations — not based on historical data.")
+
+    exec_focus_area = st.selectbox(
+        "Focus area (optional)",
+        ["General pricing health", "Margin protection", "Discount governance",
+         "Competitive positioning", "New customer pricing"],
+        key="copilot_exec_focus",
+    )
+
+    if st.button("Generate Recommendations", key="copilot_exec_btn"):
+        try:
+            if not _cortex_ok:
+                st.info("Cortex AI is currently unavailable — please try again later.")
+            else:
+                with st.spinner("Generating recommendations…"):
+                    prompt = f"""You are a Chief Pricing Officer's AI advisor for a B2B manufacturing company.
+Give 5 general, best-practice pricing recommendations focused on: {exec_focus_area}.
+Respond ONLY with a JSON object, no markdown, no text outside JSON:
+{{"recommendations":[{{"title":"<short action title>","detail":"<1-2 sentences>","priority":"High"}}, ...]}}
+Each item must have priority High, Medium, or Low. Do not reference any specific company, customer, or numeric data you were not given.
+"""
+                    result = call_cortex(CORTEX_MODEL, prompt)
+                    if result.get("error"):
+                        st.warning(f"Could not generate recommendations: {result['error']}")
+                    else:
+                        raw_text = result.get("raw_text", "") or ""
+                        try:
+                            parsed = _extract_ai_json(raw_text)
+                        except Exception:
+                            parsed = {}
+
+                        recos = (parsed.get("recommendations") or [])[:5] if parsed else []
+                        if recos:
+                            priority_badge_map = {"High": "red", "Medium": "amber", "Low": "green"}
+                            for reco in recos:
+                                badge_cls = priority_badge_map.get(reco.get("priority", "Medium"), "amber")
+                                st.markdown(
+                                    f'<div class="insight-box">'
+                                    f'<span class="badge {badge_cls}">{reco.get("priority","Medium")}</span> '
+                                    f'<strong>{reco.get("title","")}</strong><br>'
+                                    f'{reco.get("detail","")}'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.markdown(f'<div class="insight-box">{raw_text or "No response received."}</div>', unsafe_allow_html=True)
+
+                        try:
+                            log_copilot_action("Executive Recommendations", raw_text, "shown")
+                        except Exception:
+                            pass
+        except Exception as e:
+            st.warning(f"Executive Recommendations is temporarily unavailable: {e}")
+
+    st.markdown("---")
+
+    # ───────────────────────────────────────────────────────────────────
+    # FEATURE 5 — ACTION LEDGER
+    # ───────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📒 Action Ledger</div>', unsafe_allow_html=True)
+    st.caption("Recent AI Copilot actions logged from this tab.")
+
     try:
-        ledger = session.sql(
-            f"SELECT * FROM {fq_pricing('COPILOT_ACTION_LEDGER')} ORDER BY TIMESTAMP DESC LIMIT 100"
+        ledger_df = session.sql(
+            f"SELECT TIMESTAMP, FEATURE_NAME, STATUS, QUOTE_ID FROM {fq_pricing('COPILOT_ACTION_LEDGER')} "
+            f"ORDER BY TIMESTAMP DESC LIMIT 25"
         ).to_pandas()
-        if ledger.empty:
-            st.caption("No Copilot actions logged yet.")
+        if ledger_df.empty:
+            st.info("No actions logged yet.")
         else:
-            feature_filter = st.multiselect(
-                "Filter by feature",
-                options=sorted(ledger["FEATURE_NAME"].unique()),
-                key="copilot_ledger_filter",
-            )
-            display_ledger = ledger[ledger["FEATURE_NAME"].isin(feature_filter)] if feature_filter else ledger
-            st.dataframe(display_ledger, use_container_width=True)
+            st.dataframe(ledger_df, use_container_width=True, hide_index=True)
     except Exception:
-        st.caption("No Copilot actions logged yet — the table is created on first write.") 
-
+        st.info("No actions logged yet.")
